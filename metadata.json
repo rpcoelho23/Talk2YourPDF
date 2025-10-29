@@ -1,0 +1,7 @@
+{
+  "name": "Talk to you PDF",
+  "description": "An evolution of NotebookLM. Upload a PDF to get a summary, chat about the document's contents, and use voice commands to interact with Gemini. Pin important insights to your personal studio.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
