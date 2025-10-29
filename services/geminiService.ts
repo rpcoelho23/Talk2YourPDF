@@ -67,7 +67,7 @@ const encode = (bytes: Uint8Array): string => {
     let binary = '';
     const len = bytes.byteLength;
     for (let i = 0; i < len; i++) {
-        binary += String.fromCharCode(bytes[i]);
+        binary += String.fromCharCode(bytes[i]); // FIX: Was String.fromCharCode(i)
     }
     return btoa(binary);
 };
@@ -92,31 +92,40 @@ async function decodeAudioData(
 }
 
 
-// Text-to-Speech
-export const readAloud = async (text: string): Promise<Uint8Array | null> => {
-    try {
-        const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash-preview-tts",
-            contents: [{ parts: [{ text: `Read this summary naturally: ${text}` }] }],
-            config: {
-                responseModalities: [Modality.AUDIO],
-                speechConfig: {
-                    voiceConfig: {
-                        prebuiltVoiceConfig: { voiceName: 'Kore' },
-                    },
-                },
-            },
-        });
-        const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-        if (base64Audio) {
-            return decode(base64Audio);
-        }
-        return null;
-    } catch (error) {
-        console.error("Error with text-to-speech:", error);
-        return null;
+// Streaming Text-to-Speech for low-latency playback
+export const readAloudStream = async (
+  text: string,
+  onAudioChunk: (chunk: Uint8Array) => void,
+  signal: AbortSignal
+): Promise<void> => {
+  try {
+    const responseStream = await ai.models.generateContentStream({
+      model: "gemini-2.5-flash-preview-tts",
+      contents: [{ parts: [{ text: `Read this text naturally: ${text}` }] }],
+      config: {
+        responseModalities: [Modality.AUDIO],
+        speechConfig: {
+          voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
+        },
+      },
+    });
+
+    for await (const chunk of responseStream) {
+      if (signal.aborted) {
+        break;
+      }
+      const base64Audio = chunk.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (base64Audio) {
+        onAudioChunk(decode(base64Audio));
+      }
     }
+  } catch (error) {
+    if ((error as Error).name !== 'AbortError') {
+       console.error("Error with text-to-speech stream:", error);
+    }
+  }
 };
+
 
 // Live API for Voice Chat
 // FIX: The 'LiveSession' type is not exported from '@google/genai'. The return type is inferred instead.

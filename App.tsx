@@ -1,7 +1,7 @@
 
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import type { Source, ChatMessage, SavedNote, Notebook } from './types';
-import { getSummary, getTitleFromSummary, getAnswer, readAloud, createLiveSession, createAudioBlob, decodeAudioData, decode } from './services/geminiService';
+import { getSummary, getTitleFromSummary, getAnswer, readAloudStream, createLiveSession, createAudioBlob, decodeAudioData, decode } from './services/geminiService';
 import type { LiveServerMessage } from '@google/genai';
 import {
     PdfIcon, ChartBarIcon, CheckIcon, PinIcon, SpeakerWaveIcon, MicrophoneIcon,
@@ -251,6 +251,66 @@ const DocumentViewerPanel: React.FC<DocumentViewerPanelProps> = ({ source }) => 
     );
 };
 
+// This code runs in a separate thread and is responsible for processing audio data.
+const audioWorkletProcessorCode = `
+class StreamingAudioProcessor extends AudioWorkletProcessor {
+    constructor() {
+        super();
+        this.chunks = [];
+        this.streamEnded = false;
+        
+        this.port.onmessage = (event) => {
+            if (event.data === null) {
+                this.streamEnded = true;
+            } else if (event.data instanceof Float32Array) {
+                this.chunks.push(event.data);
+            }
+        };
+    }
+
+    process(inputs, outputs, parameters) {
+        const outputChannel = outputs[0][0];
+        const bufferSize = outputChannel.length;
+        let samplesProcessed = 0;
+
+        while (samplesProcessed < bufferSize && this.chunks.length > 0) {
+            const chunk = this.chunks[0];
+            const remainingInChunk = chunk.length;
+            const toProcess = Math.min(bufferSize - samplesProcessed, remainingInChunk);
+
+            outputChannel.set(chunk.subarray(0, toProcess), samplesProcessed);
+            
+            samplesProcessed += toProcess;
+
+            if (toProcess < remainingInChunk) {
+                this.chunks[0] = chunk.subarray(toProcess);
+            } else {
+                this.chunks.shift();
+            }
+        }
+
+        if (samplesProcessed < bufferSize) {
+            outputChannel.fill(0, samplesProcessed);
+        }
+        
+        if (this.streamEnded && this.chunks.length === 0) {
+            this.port.postMessage('playback-finished');
+            this.streamEnded = false; 
+        }
+
+        return true;
+    }
+}
+
+registerProcessor('streaming-audio-processor', StreamingAudioProcessor);
+`;
+
+// Splits text into sentences for chunked TTS streaming
+const splitIntoSentences = (text: string): string[] => {
+    // This regex matches sentences ending in ., ?, or !, and handles the end of the string.
+    const sentences = text.match(/[^.!?]+[.!?]\s*|[^.!?]+$/g);
+    return sentences ? sentences.map(s => s.trim()).filter(s => s.length > 0) : [];
+};
 
 // Chat Panel Component
 interface ChatPanelProps {
@@ -268,24 +328,36 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ chatHistory, onSendMessage, onPin
     const [input, setInput] = useState('');
     const chatEndRef = useRef<HTMLDivElement>(null);
     const [playingMessageId, setPlayingMessageId] = useState<string | null>(null);
+    
+    // Refs for AudioWorklet-based streaming playback
     const audioContextRef = useRef<AudioContext | null>(null);
-    const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
+    const audioWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
+    const abortControllerRef = useRef<AbortController | null>(null);
     
     useEffect(() => {
         chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }, [chatHistory]);
 
+    const stopPlayback = useCallback(() => {
+        abortControllerRef.current?.abort();
+        abortControllerRef.current = null;
+        if (audioWorkletNodeRef.current) {
+            audioWorkletNodeRef.current.port.onmessage = null;
+            audioWorkletNodeRef.current.disconnect();
+            audioWorkletNodeRef.current = null;
+        }
+        setPlayingMessageId(null);
+    }, []);
+
     // Cleanup audio resources on component unmount
     useEffect(() => {
         return () => {
-            if (audioSourceRef.current) {
-                audioSourceRef.current.stop();
-            }
+            stopPlayback();
             if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
                 audioContextRef.current.close();
             }
         };
-    }, []);
+    }, [stopPlayback]);
 
     const handleSend = () => {
         if (input.trim() && !isLoading) {
@@ -295,47 +367,75 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ chatHistory, onSendMessage, onPin
     };
 
     const handleToggleReadAloud = async ({ id, text }: { id: string, text: string }) => {
-        if (audioSourceRef.current) {
-            audioSourceRef.current.onended = null;
-            audioSourceRef.current.stop();
-            audioSourceRef.current = null;
-        }
-
         if (playingMessageId === id) {
-            setPlayingMessageId(null);
+            stopPlayback();
             return;
         }
 
-        setPlayingMessageId(id);
-        const audioData = await readAloud(text);
+        stopPlayback(); // Stop any currently playing audio
 
-        if (audioData) {
+        const controller = new AbortController();
+        abortControllerRef.current = controller;
+        setPlayingMessageId(id);
+
+        try {
             if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
                 audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
             }
             const audioContext = audioContextRef.current;
-            
             if (audioContext.state === 'suspended') {
                 await audioContext.resume();
             }
+
+            const workletBlob = new Blob([audioWorkletProcessorCode], { type: 'application/javascript' });
+            const workletURL = URL.createObjectURL(workletBlob);
+            await audioContext.audioWorklet.addModule(workletURL);
             
-            const audioBuffer = await decodeAudioData(audioData, audioContext, 24000, 1);
-            const sourceNode = audioContext.createBufferSource();
-            sourceNode.buffer = audioBuffer;
-            sourceNode.connect(audioContext.destination);
-            sourceNode.onended = () => {
-                setPlayingMessageId(null);
-                audioSourceRef.current = null;
+            const workletNode = new AudioWorkletNode(audioContext, 'streaming-audio-processor');
+            workletNode.port.onmessage = (event) => {
+                if (event.data === 'playback-finished') {
+                    stopPlayback();
+                }
             };
-            sourceNode.start();
-            audioSourceRef.current = sourceNode;
-        } else {
-            setPlayingMessageId(null);
-            alert("Sorry, could not generate audio for this message.");
+            workletNode.connect(audioContext.destination);
+            audioWorkletNodeRef.current = workletNode;
+            
+            const sentences = splitIntoSentences(text);
+
+            for (const sentence of sentences) {
+                if (controller.signal.aborted) break;
+                
+                await readAloudStream(
+                    sentence,
+                    (audioChunk) => { // onAudioChunk callback
+                        if (controller.signal.aborted || !audioWorkletNodeRef.current) return;
+                        
+                        const pcm16 = new Int16Array(audioChunk.buffer, audioChunk.byteOffset, audioChunk.byteLength / 2);
+                        const float32 = new Float32Array(pcm16.length);
+                        for (let i = 0; i < pcm16.length; i++) {
+                            float32[i] = pcm16[i] / 32768.0;
+                        }
+                        
+                        audioWorkletNodeRef.current.port.postMessage(float32);
+                    },
+                    controller.signal
+                );
+            }
+
+        } catch (error) {
+            if ((error as Error).name !== 'AbortError') {
+                console.error("Failed to stream audio", error);
+                alert("Sorry, could not generate audio for this message.");
+                stopPlayback();
+            }
+        } finally {
+            if (!controller.signal.aborted && audioWorkletNodeRef.current) {
+                // Signal to the worklet that the stream has ended.
+                audioWorkletNodeRef.current.port.postMessage(null);
+            }
         }
     };
     
-
     const chatInputArea = isVoiceMode ? (
          <div className="flex items-center justify-center p-4 bg-gray-900 rounded-b-lg border-t border-gray-700 h-[120px]">
             <button onClick={toggleVoiceMode} className={`flex items-center justify-center w-20 h-20 rounded-full transition-colors ${isListening ? 'bg-red-500 hover:bg-red-600 animate-pulse' : 'bg-blue-600 hover:bg-blue-700'}`}>
@@ -433,18 +533,17 @@ interface RightPanelProps {
     onDeleteNotebook: (id: string) => void;
 }
 const RightPanel: React.FC<RightPanelProps> = (props) => {
-    const [activeTab, setActiveTab] = useState<'notes' | 'notebooks'>('notebooks');
+    const [activeTab, setActiveTab] = useState<'notes' | 'notebooks'>(props.activeNotebookId ? 'notes' : 'notebooks');
 
-    // Automatically switch to notebooks tab if there's no active notebook
+    // This effect ensures the correct tab is shown when the active notebook changes.
+    // Crucially, it does NOT depend on `activeTab`, so manual tab switching is not overridden.
     useEffect(() => {
-        if (!props.activeNotebookId) {
-            setActiveTab('notebooks');
+        if (props.activeNotebookId) {
+            // When a notebook is selected or becomes active, switch to its notes view.
+            setActiveTab('notes');
         } else {
-            // Switch to notes tab if a notebook is active and user was on notebooks tab
-            // This provides a better UX after creating/selecting a notebook
-            if(activeTab === 'notebooks') {
-                setActiveTab('notes');
-            }
+            // If there's no active notebook, default to the notebook list.
+            setActiveTab('notebooks');
         }
     }, [props.activeNotebookId]);
 
@@ -635,8 +734,8 @@ const App: React.FC = () => {
     const handleFileUpload = async (file: File) => {
         let currentNotebookId = activeNotebookId;
 
-        // If there's no active notebook, create one automatically.
-        if (!currentNotebookId) {
+        // If there's no active notebook, or the active one already has a source, create one automatically.
+        if (!currentNotebookId || activeNotebook?.source) {
             const newNotebook: Notebook = {
                 id: crypto.randomUUID(),
                 name: "Processing PDF...",
@@ -695,7 +794,7 @@ const App: React.FC = () => {
             // Clean up the automatically created notebook on failure
             setNotebooks(prev => prev.filter(n => n.id !== currentNotebookId));
             if (activeNotebookId === currentNotebookId) {
-                 setActiveNotebookId(null);
+                 setActiveNotebookId(notebooks.length > 1 ? notebooks[0].id : null);
             }
         } finally {
             setIsLoading(false);
