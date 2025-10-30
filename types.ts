@@ -3,7 +3,7 @@ export interface Source {
   id: string;
   name: string;
   content: string; // The extracted text for Gemini
-  fileDataUrl: string; // Base64 encoded data URL for the PDF viewer
+  fileDataUrl?: string; // Base64 encoded data URL for the PDF viewer - optional, loaded on demand or for import/export
 }
 
 export interface ChatMessage {
@@ -26,7 +26,7 @@ export interface SavedNote {
 export interface Notebook {
   id:string;
   name: string;
-  source: Source;
+  source: Source | null;
   chatHistory: ChatMessage[];
   savedNotes: SavedNote[];
   createdAt: string;

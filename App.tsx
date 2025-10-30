@@ -2,7 +2,8 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import type { Source, ChatMessage, SavedNote, Notebook } from './types';
 import { getSummary, getTitleFromSummary, getAnswer, readAloudStream, createLiveSession, createAudioBlob, decodeAudioData, decode } from './services/geminiService';
-import type { LiveServerMessage } from '@google/ai/generativelanguage';
+import { savePdfData, getPdfData, deletePdfData } from './services/db';
+import type { LiveServerMessage } from '@google/genai';
 import {
     PdfIcon, ChartBarIcon, CheckIcon, PinIcon, SpeakerWaveIcon, MicrophoneIcon,
     StopCircleIcon, ArrowUpCircleIcon, PencilIcon, TrashIcon, ArrowDownTrayIcon, ArrowUpTrayIcon
@@ -17,6 +18,18 @@ const fileToBase64 = (file: File): Promise<string> =>
     reader.onerror = (error) => reject(error);
   });
 
+// Helper to convert Base64 data URL back to a Blob
+const base64ToBlob = (dataUrl: string): Blob => {
+    const [header, data] = dataUrl.split(',');
+    const mime = header.match(/:(.*?);/)?.[1];
+    const byteString = atob(data);
+    let n = byteString.length;
+    const u8arr = new Uint8Array(n);
+    while (n--) {
+        u8arr[n] = byteString.charCodeAt(n);
+    }
+    return new Blob([u8arr], { type: mime });
+}
 
 // Panel Header Component
 interface PanelHeaderProps {
@@ -33,45 +46,41 @@ const PanelHeader: React.FC<PanelHeaderProps> = ({ title, children }) => (
 // Sources Panel Component
 interface SourcesPanelProps {
   source: Source | null;
-  onFileUpload: (file: File) => void;
+  onFilePicked: (file: File) => void;
   isLoading: boolean;
   hasActiveNotebook: boolean;
   isDocumentViewActive: boolean;
   onToggleDocumentView: () => void;
 }
-const SourcesPanel: React.FC<SourcesPanelProps> = ({ source, onFileUpload, isLoading, hasActiveNotebook, isDocumentViewActive, onToggleDocumentView }) => {
+const SourcesPanel: React.FC<SourcesPanelProps> = ({ source, onFilePicked, isLoading, hasActiveNotebook, isDocumentViewActive, onToggleDocumentView }) => {
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     const handleAddClick = () => {
-        // Reset the value to ensure onChange fires even if the same file is selected again
-        if(fileInputRef.current) {
-            fileInputRef.current.value = "";
-        }
         fileInputRef.current?.click();
     };
-
+    
     const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
         const file = event.target.files?.[0];
-        if (file && file.type === 'application/pdf') {
-            onFileUpload(file);
-        } else if (file) {
-            alert('Please upload a valid PDF file.');
+        if (file) {
+            onFilePicked(file);
+        }
+         if (event.target) {
+            event.target.value = '';
         }
     };
-    
+
   return (
     <div className="flex flex-col bg-gray-900/50 h-full rounded-lg border border-gray-700">
       <PanelHeader title="Sources" />
       <div className="p-4 space-y-4">
+        <input
+            type="file"
+            ref={fileInputRef}
+            onChange={handleFileChange}
+            className="hidden"
+            accept="application/pdf"
+        />
         <div className="flex gap-2">
-            <input
-                type="file"
-                ref={fileInputRef}
-                onChange={handleFileChange}
-                className="hidden"
-                accept="application/pdf"
-                disabled={ (hasActiveNotebook && !!source) || isLoading}
-            />
           <button onClick={handleAddClick} disabled={(hasActiveNotebook && !!source) || isLoading} className="flex-1 bg-gray-700 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded-lg transition-colors disabled:bg-gray-800 disabled:cursor-not-allowed">
             {isLoading ? 'Processing...' : '+ Add'}
           </button>
@@ -98,7 +107,7 @@ const SourcesPanel: React.FC<SourcesPanelProps> = ({ source, onFileUpload, isLoa
 
 // Document Viewer Panel Component using PDF.js
 interface DocumentViewerPanelProps {
-    source: Source;
+    source: Source & { fileDataUrl: string }; // fileDataUrl is guaranteed here
 }
 const DocumentViewerPanel: React.FC<DocumentViewerPanelProps> = ({ source }) => {
     const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -106,14 +115,16 @@ const DocumentViewerPanel: React.FC<DocumentViewerPanelProps> = ({ source }) => 
     const [pdfDoc, setPdfDoc] = useState<any | null>(null);
     const [pageNum, setPageNum] = useState(1);
     const [numPages, setNumPages] = useState(0);
-    const [isRendering, setIsRendering] = useState(false);
-    const [isInitialScaleSet, setIsInitialScaleSet] = useState(false);
     const [scale, setScale] = useState(1.0);
     const [error, setError] = useState<string | null>(null);
 
+    // Unified state for UI: loading document, rendering page, or ready/idle.
+    const [viewState, setViewState] = useState<'loading' | 'rendering' | 'ready'>('loading');
+    const isRendering = viewState === 'rendering'; // Derived state for disabling controls
+
     // Effect to load the PDF document from the source data
     useEffect(() => {
-        setIsInitialScaleSet(false); // Reset scale flag on new document
+        setViewState('loading');
         setPdfDoc(null);
 
         const loadPdf = async () => {
@@ -122,6 +133,7 @@ const DocumentViewerPanel: React.FC<DocumentViewerPanelProps> = ({ source }) => 
             const pdfjsLib = (window as any).pdfjsLib;
             if (!pdfjsLib) {
                 setError("PDF.js library is not loaded.");
+                setViewState('ready');
                 return;
             }
             
@@ -140,82 +152,88 @@ const DocumentViewerPanel: React.FC<DocumentViewerPanelProps> = ({ source }) => 
                 console.error('Error loading PDF:', err);
                 setError("Failed to load PDF. The file might be corrupted.");
                 setPdfDoc(null);
+                setViewState('ready');
             }
         };
 
         loadPdf();
     }, [source]);
 
+    // This callback performs the actual rendering on the canvas. It's simplified to just render.
     const renderPage = useCallback(async (doc: any, num: number, currentScale: number) => {
-        setIsRendering(true);
-        try {
-            const page = await doc.getPage(num);
-            const canvas = canvasRef.current;
-            if (!canvas) return;
-            
-            const viewport = page.getViewport({ scale: currentScale });
-            const context = canvas.getContext('2d');
-            if (!context) return;
-            
-            canvas.height = viewport.height;
-            canvas.width = viewport.width;
+        const page = await doc.getPage(num);
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        
+        const viewport = page.getViewport({ scale: currentScale });
+        const context = canvas.getContext('2d');
+        if (!context) return;
+        
+        canvas.height = viewport.height;
+        canvas.width = viewport.width;
 
-            // Force a white background to prevent dark theme rendering issues
-            context.fillStyle = 'white';
-            context.fillRect(0, 0, canvas.width, canvas.height);
+        context.fillStyle = 'white';
+        context.fillRect(0, 0, canvas.width, canvas.height);
 
-            const renderContext = {
-                canvasContext: context,
-                viewport: viewport,
-                renderInteractiveForms: false,
-                background: 'rgba(255,255,255,1)', // Explicitly set background
-            };
-            await page.render(renderContext).promise;
-        } catch(err) {
-            console.error("Failed to render page", err);
-        } finally {
-            setIsRendering(false);
-        }
+        const renderContext = {
+            canvasContext: context,
+            viewport: viewport,
+            renderInteractiveForms: false,
+            background: 'rgba(255,255,255,1)',
+        };
+        await page.render(renderContext).promise;
     }, []);
-
-    // Effect for auto-scaling and handling container resize.
+    
+    // Main effect for scaling and rendering. Handles initial load, page changes, and container resizing.
     useEffect(() => {
         if (!pdfDoc || !containerRef.current) return;
+
+        let isMounted = true;
         const container = containerRef.current;
 
-        const calculateAndSetScale = () => {
-            if (pdfDoc.getPage) {
-                pdfDoc.getPage(1).then((page: any) => {
-                    if (!containerRef.current) return;
-                    const viewport = page.getViewport({ scale: 1 });
-                    const newScale = Math.min(
-                        containerRef.current.clientWidth / viewport.width,
-                        containerRef.current.clientHeight / viewport.height
-                    ) * 0.95; // 5% padding
-                    setScale(newScale);
-                    setIsInitialScaleSet(true); // Signal that the initial scale is set
-                });
+        const scaleAndRender = async () => {
+            // Guard against rendering when the container has no size yet, preventing flicker/errors.
+            if (!isMounted || !containerRef.current || containerRef.current.clientWidth === 0) {
+                return;
+            }
+            
+            setViewState('rendering');
+
+            try {
+                const page = await pdfDoc.getPage(pageNum);
+                if (!containerRef.current || !isMounted) return;
+
+                const viewport = page.getViewport({ scale: 1 });
+                const newScale = Math.min(
+                    containerRef.current.clientWidth / viewport.width,
+                    containerRef.current.clientHeight / viewport.height
+                ) * 0.95; // 5% padding
+                
+                setScale(newScale);
+
+                await renderPage(pdfDoc, pageNum, newScale);
+                
+                if(isMounted) {
+                    setError(null); // Clear any previous errors on a successful render
+                    setViewState('ready');
+                }
+            } catch (err) {
+                console.error('Error during render:', err);
+                 if (isMounted) {
+                    setError("Failed to render the page.");
+                    setViewState('ready'); // Exit rendering state even on error
+                }
             }
         };
         
-        // Use a ResizeObserver to rescale when the container size changes
-        const observer = new ResizeObserver(calculateAndSetScale);
+        const observer = new ResizeObserver(scaleAndRender);
         observer.observe(container);
-        
+
         return () => {
-             if (container) {
-                observer.unobserve(container);
-            }
+            isMounted = false;
+            if(container) observer.unobserve(container);
         };
-    }, [pdfDoc]);
-
-
-    // Effect to render a page when ready
-    useEffect(() => {
-        if (pdfDoc && isInitialScaleSet) {
-            renderPage(pdfDoc, pageNum, scale);
-        }
-    }, [pdfDoc, pageNum, scale, isInitialScaleSet, renderPage]);
+    }, [pdfDoc, pageNum, renderPage]);
     
     const goToPrevPage = () => setPageNum(prev => Math.max(1, prev - 1));
     const goToNextPage = () => setPageNum(prev => Math.min(numPages, prev + 1));
@@ -239,12 +257,12 @@ const DocumentViewerPanel: React.FC<DocumentViewerPanelProps> = ({ source }) => 
             )}
             <div ref={containerRef} className="flex-1 overflow-auto p-4 flex justify-center items-center bg-gray-900/50">
                 <div className='relative'>
-                    {(!isInitialScaleSet || isRendering) && (
+                    {viewState !== 'ready' && (
                         <div className="absolute inset-0 flex items-center justify-center text-gray-400">
-                             <p>{error || (pdfDoc ? "Rendering page..." : "Loading document...")}</p>
+                             <p>{error || (viewState === 'loading' ? "Loading document..." : "Rendering page...")}</p>
                         </div>
                     )}
-                    <canvas ref={canvasRef} className={`rounded-md shadow-lg ${isRendering || !isInitialScaleSet ? 'opacity-20' : 'opacity-100'} transition-opacity`}></canvas>
+                    <canvas ref={canvasRef} className={`rounded-md shadow-lg ${viewState !== 'ready' ? 'opacity-20' : 'opacity-100'} transition-opacity`}></canvas>
                 </div>
             </div>
         </div>
@@ -646,6 +664,7 @@ const NotebooksList: React.FC<RightPanelProps> = ({ notebooks, activeNotebookId,
                         ref={loadFileInputRef}
                         onChange={handleFileLoad}
                         className="hidden"
+                        accept="application/json"
                     />
                     <button onClick={onSaveNotebooks} className="flex-1 flex items-center justify-center gap-2 bg-gray-700 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded-lg transition-colors text-sm">
                         <ArrowDownTrayIcon className="w-4 h-4" /> Save All to File
@@ -701,7 +720,8 @@ const App: React.FC = () => {
     const [isVoiceMode, setIsVoiceMode] = useState(false);
     const [isListening, setIsListening] = useState(false);
     const [isDocumentViewActive, setIsDocumentViewActive] = useState(false);
-    
+    const [activePdfDataUrl, setActivePdfDataUrl] = useState<string | null>(null);
+
     const { notebooks, activeNotebookId } = workspace;
     const activeNotebook = notebooks.find(n => n.id === activeNotebookId) || null;
     
@@ -709,10 +729,10 @@ const App: React.FC = () => {
         try {
             const savedData = localStorage.getItem('notebook_workspace');
             if (savedData) {
-                const loadedWorkspace: Workspace = JSON.parse(savedData);
+                const loadedData = JSON.parse(savedData);
                 // Basic validation
-                if (loadedWorkspace && Array.isArray(loadedWorkspace.notebooks)) {
-                   setWorkspace(loadedWorkspace);
+                if (loadedData && Array.isArray(loadedData.notebooks)) {
+                   setWorkspace(loadedData);
                 }
             }
         } catch (error) {
@@ -722,7 +742,16 @@ const App: React.FC = () => {
 
     useEffect(() => {
         try {
-            localStorage.setItem('notebook_workspace', JSON.stringify(workspace));
+            // Save everything *except* the PDF data URL to avoid quota errors.
+            const dataToSave: Workspace = {
+                ...workspace,
+                notebooks: workspace.notebooks.map(nb => {
+                    if (!nb.source) return nb;
+                    const { fileDataUrl, ...sourceWithoutDataUrl } = nb.source;
+                    return { ...nb, source: sourceWithoutDataUrl as Source };
+                })
+            };
+            localStorage.setItem('notebook_workspace', JSON.stringify(dataToSave));
         } catch (error) {
             console.error("Failed to save to localStorage", error);
         }
@@ -734,7 +763,7 @@ const App: React.FC = () => {
         const newNotebookTemplate: Notebook = {
             id: crypto.randomUUID(),
             name: `Untitled ${timestamp.toLocaleTimeString()}`,
-            source: null!, 
+            source: null, 
             chatHistory: [],
             savedNotes: [],
             createdAt: timestamp.toLocaleDateString()
@@ -758,6 +787,9 @@ const App: React.FC = () => {
     };
     const handleDeleteNotebook = (id: string) => {
         if (window.confirm("Are you sure you want to delete this notebook?")) {
+            // Also delete the persisted file data
+            deletePdfData(id).catch(err => console.error("Could not delete PDF data:", err));
+            
             setWorkspace(prev => {
                 const remainingNotebooks = prev.notebooks.filter(n => n.id !== id);
                 const newActiveId = prev.activeNotebookId === id
@@ -772,17 +804,16 @@ const App: React.FC = () => {
         }
     };
     
-    const handleFileUpload = async (file: File) => {
+    const handleFilePicked = async (file: File) => {
         let isNewNotebook = false;
         let notebookToUpdateId = activeNotebookId;
 
-        // If there's no active notebook, or the active one already has a source, create one automatically.
         if (!notebookToUpdateId || activeNotebook?.source) {
             isNewNotebook = true;
             const newNotebook: Notebook = {
                 id: crypto.randomUUID(),
                 name: "Processing PDF...",
-                source: null!,
+                source: null,
                 chatHistory: [],
                 savedNotes: [],
                 createdAt: new Date().toLocaleDateString(),
@@ -797,13 +828,14 @@ const App: React.FC = () => {
         setIsLoading(true);
         setIsDocumentViewActive(false);
         try {
-            const fileDataUrl = await fileToBase64(file);
             const pdfjsLib = (window as any).pdfjsLib;
             if (!pdfjsLib) throw new Error("PDF.js library not loaded.");
             
             pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js`;
-            const loadingTask = pdfjsLib.getDocument(fileDataUrl);
+            const fileData = await file.arrayBuffer();
+            const loadingTask = pdfjsLib.getDocument(fileData);
             const doc = await loadingTask.promise;
+            
             let extractedText = '';
             for (let i = 1; i <= doc.numPages; i++) {
                 const page = await doc.getPage(i);
@@ -815,8 +847,13 @@ const App: React.FC = () => {
                 id: crypto.randomUUID(),
                 name: file.name,
                 content: extractedText,
-                fileDataUrl: fileDataUrl,
+                // fileDataUrl is intentionally omitted from the state
             };
+            
+            if (notebookToUpdateId) {
+                const dataUrl = await fileToBase64(file);
+                await savePdfData(notebookToUpdateId, dataUrl);
+            }
 
             const summary = await getSummary(source.content);
             const title = await getTitleFromSummary(summary);
@@ -839,24 +876,37 @@ const App: React.FC = () => {
         } catch (error) {
             console.error("Error processing PDF:", error);
             alert("There was an error processing the PDF. It may be corrupted.");
-            // Clean up the automatically created notebook on failure
              if (isNewNotebook) {
-                setWorkspace(prev => {
-                    const remainingNotebooks = prev.notebooks.filter(n => n.id !== notebookToUpdateId);
-                    const newActiveId = prev.activeNotebookId === notebookToUpdateId
-                        ? (notebooks.length > 1 ? notebooks[0].id : null)
-                        : prev.activeNotebookId;
-                    return { notebooks: remainingNotebooks, activeNotebookId: newActiveId };
-                });
+                setWorkspace(prev => ({ ...prev, notebooks: prev.notebooks.filter(n => n.id !== notebookToUpdateId) }));
             }
         } finally {
             setIsLoading(false);
         }
     };
 
-    const handleToggleDocumentView = () => {
+    const handleToggleDocumentView = async () => {
+        if (isDocumentViewActive) {
+            setIsDocumentViewActive(false);
+            setActivePdfDataUrl(null);
+            return;
+        }
+
         if (activeNotebook?.source) {
-            setIsDocumentViewActive(prev => !prev);
+            setIsLoading(true);
+            try {
+                const dataUrl = await getPdfData(activeNotebook.id);
+                if (dataUrl) {
+                    setActivePdfDataUrl(dataUrl);
+                    setIsDocumentViewActive(true);
+                } else {
+                    alert("Could not find the source PDF file data. It may have been cleared from your browser cache. Please add the source again.");
+                }
+            } catch (error) {
+                console.error("Error accessing file data:", error);
+                alert(`Could not access the source PDF file data. Error: ${(error as Error).message}`);
+            } finally {
+                setIsLoading(false);
+            }
         }
     };
 
@@ -917,6 +967,9 @@ const App: React.FC = () => {
     const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
     const mediaStreamSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
     const audioSourceNodesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+    const currentInputTranscriptionRef = useRef('');
+    const currentOutputTranscriptionRef = useRef('');
+
 
     const stopVoiceMode = useCallback(() => {
         setIsListening(false);
@@ -957,6 +1010,7 @@ const App: React.FC = () => {
 
             const sessionPromise = createLiveSession(
                 async (message: LiveServerMessage) => {
+                    // 1. Handle audio playback
                     const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
                     if (base64Audio && outputAudioContextRef.current) {
                         const outputCtx = outputAudioContextRef.current;
@@ -975,6 +1029,47 @@ const App: React.FC = () => {
                         nextStartTime += audioBuffer.duration;
                         audioSourceNodesRef.current.add(sourceNode);
                     }
+
+                    // 2. Handle transcription
+                    if (message.serverContent?.inputTranscription) {
+                        currentInputTranscriptionRef.current += message.serverContent.inputTranscription.text;
+                    }
+                    if (message.serverContent?.outputTranscription) {
+                        currentOutputTranscriptionRef.current += message.serverContent.outputTranscription.text;
+                    }
+
+                    // 3. Handle turn completion to update chat history
+                    if (message.serverContent?.turnComplete) {
+                        const finalInput = currentInputTranscriptionRef.current.trim();
+                        const finalOutput = currentOutputTranscriptionRef.current.trim();
+
+                        if (finalInput) { // Only update if the user actually spoke
+                             const userInput: ChatMessage = {
+                                id: crypto.randomUUID(),
+                                sender: 'user',
+                                text: finalInput,
+                            };
+                            const aiResponse: ChatMessage = {
+                                id: crypto.randomUUID(),
+                                sender: 'ai',
+                                text: finalOutput,
+                                question: finalInput,
+                            };
+
+                            setWorkspace(prev => ({
+                                ...prev,
+                                notebooks: prev.notebooks.map(n =>
+                                    n.id === activeNotebookId
+                                        ? { ...n, chatHistory: [...n.chatHistory, userInput, aiResponse] }
+                                        : n
+                                )
+                            }));
+                        }
+                        
+                        // Reset for the next turn
+                        currentInputTranscriptionRef.current = '';
+                        currentOutputTranscriptionRef.current = '';
+                    }
                 },
                 (error) => { console.error("Live session error:", error); stopVoiceMode(); },
                 () => { console.log("Live session closed."); stopVoiceMode(); }
@@ -992,7 +1087,9 @@ const App: React.FC = () => {
                 
                 scriptProcessorRef.current.onaudioprocess = (e) => {
                     const inputData = e.inputBuffer.getChannelData(0);
-                    liveSessionRef.current?.sendRealtimeInput({ media: createAudioBlob(inputData) });
+                    sessionPromise.then((session) => {
+                        session.sendRealtimeInput({ media: createAudioBlob(inputData) });
+                    });
                 };
 
                 mediaStreamSourceRef.current.connect(scriptProcessorRef.current);
@@ -1004,24 +1101,32 @@ const App: React.FC = () => {
             alert("Could not access microphone. Please check permissions.");
             stopVoiceMode();
         }
-    }, [activeNotebook, stopVoiceMode]);
+    }, [activeNotebook, stopVoiceMode, activeNotebookId]);
     
     const toggleVoiceMode = () => { isVoiceMode ? stopVoiceMode() : startVoiceMode(); };
     useEffect(() => () => stopVoiceMode(), [stopVoiceMode]);
 
-    const handleSaveNotebooks = () => {
+    const handleSaveNotebooks = async () => {
         if (notebooks.length === 0) {
             alert("There are no notebooks to save.");
             return;
         }
+        setIsLoading(true);
         try {
-            const pdfDataMissing = workspace.notebooks.some(n => n.source && (!n.source.fileDataUrl || n.source.fileDataUrl.length < 100));
-            if (pdfDataMissing) {
-                alert("Error: Some PDF data appears to be missing. Cannot save correctly. Please try reloading the page and your file.");
-                return;
-            }
+            // Create a deep clone to avoid mutating state
+            const workspaceToSave: Workspace = JSON.parse(JSON.stringify(workspace));
 
-            const dataStr = JSON.stringify(workspace, null, 2); 
+            // Enhance notebooks with embedded PDF data
+            await Promise.all(workspaceToSave.notebooks.map(async (nb) => {
+                if (nb.source) {
+                    const dataUrl = await getPdfData(nb.id);
+                    if (dataUrl) {
+                        nb.source.fileDataUrl = dataUrl;
+                    }
+                }
+            }));
+
+            const dataStr = JSON.stringify(workspaceToSave, null, 2); 
             const dataBlob = new Blob([dataStr], { type: "application/json" });
             const url = URL.createObjectURL(dataBlob);
             const link = document.createElement('a');
@@ -1034,41 +1139,75 @@ const App: React.FC = () => {
         } catch (error) {
             console.error("Failed to save notebooks:", error);
             alert("An error occurred while trying to save the notebooks.");
+        } finally {
+            setIsLoading(false);
         }
     };
 
-    const handleLoadNotebooks = (file: File) => {
+    const handleLoadNotebooks = async (file: File) => {
         const reader = new FileReader();
-        reader.onload = (event) => {
+        reader.onload = async (event) => {
+            setIsLoading(true);
             try {
                 const content = event.target?.result;
                 if (typeof content !== 'string') throw new Error("File content is not valid.");
                 
                 const loadedWorkspace: Workspace = JSON.parse(content);
                 
-                if (loadedWorkspace && Array.isArray(loadedWorkspace.notebooks) && typeof loadedWorkspace.activeNotebookId !== 'undefined') {
-                    setWorkspace(loadedWorkspace);
-                    setIsDocumentViewActive(false);
-                } else {
-                    throw new Error("JSON file is not in the correct format. It should be an object with a 'notebooks' array and an 'activeNotebookId'.");
+                if (!loadedWorkspace || !Array.isArray(loadedWorkspace.notebooks)) {
+                    throw new Error("JSON file is not in the correct format.");
                 }
+
+                const notebooksWithPdfs = loadedWorkspace.notebooks.filter(nb => nb.source?.fileDataUrl);
+                if (notebooksWithPdfs.length > 0) {
+                     await Promise.all(notebooksWithPdfs.map(async (nb) => {
+                        if (nb.source?.fileDataUrl) {
+                            await savePdfData(nb.id, nb.source.fileDataUrl);
+                        }
+                    }));
+                }
+                
+                setWorkspace(loadedWorkspace);
+                setIsDocumentViewActive(false);
+                alert(`${loadedWorkspace.notebooks.length} notebook(s) loaded successfully.`);
+
             } catch (error) {
                 alert(`Error loading file: ${(error as Error).message}`);
+            } finally {
+                setIsLoading(false);
             }
         };
         reader.onerror = () => {
+            setIsLoading(false);
             alert("Failed to read the selected file.");
         };
         reader.readAsText(file);
     };
+
+    const displaySource = activeNotebook?.source || null;
+    const documentPanel = isDocumentViewActive && displaySource && activePdfDataUrl 
+        ? <DocumentViewerPanel source={{...displaySource, fileDataUrl: activePdfDataUrl}} />
+        : (
+            <ChatPanel
+                chatHistory={activeNotebook?.chatHistory || []}
+                onSendMessage={handleSendMessage}
+                onPinMessage={handlePinMessage}
+                isLoading={isLoading}
+                source={displaySource}
+                isVoiceMode={isVoiceMode}
+                toggleVoiceMode={toggleVoiceMode}
+                isListening={isListening}
+                notebookName={activeNotebook?.name || null}
+            />
+        );
 
     return (
         <div className="h-screen w-screen p-4 bg-gray-800 text-gray-200">
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 h-full">
             <div className="lg:col-span-3 h-full">
                 <SourcesPanel 
-                    source={activeNotebook?.source || null} 
-                    onFileUpload={handleFileUpload}
+                    source={displaySource} 
+                    onFilePicked={handleFilePicked}
                     isLoading={isLoading}
                     hasActiveNotebook={!!activeNotebook}
                     isDocumentViewActive={isDocumentViewActive}
@@ -1076,21 +1215,7 @@ const App: React.FC = () => {
                 />
             </div>
             <div className="lg:col-span-6 h-full">
-                {isDocumentViewActive && activeNotebook?.source ? (
-                    <DocumentViewerPanel source={activeNotebook.source} />
-                ) : (
-                    <ChatPanel
-                        chatHistory={activeNotebook?.chatHistory || []}
-                        onSendMessage={handleSendMessage}
-                        onPinMessage={handlePinMessage}
-                        isLoading={isLoading}
-                        source={activeNotebook?.source || null}
-                        isVoiceMode={isVoiceMode}
-                        toggleVoiceMode={toggleVoiceMode}
-                        isListening={isListening}
-                        notebookName={activeNotebook?.name || null}
-                    />
-                )}
+                {documentPanel}
             </div>
             <div className="lg:col-span-3 h-full">
                  <RightPanel

@@ -144,10 +144,12 @@ export const createLiveSession = (
         },
         config: {
             responseModalities: [Modality.AUDIO],
+            inputAudioTranscription: {}, // Enable transcription for user input
+            outputAudioTranscription: {}, // Enable transcription for model output
             speechConfig: {
                 voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
             },
-            systemInstruction: 'You are a helpful research assistant. Your answers should be based on the document provided in the conversation history. Be concise.',
+            systemInstruction: 'You are a helpful and friendly research assistant. Your answers should be based on the document provided. Be concise.',
         },
     });
     return sessionPromise;
