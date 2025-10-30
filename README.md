@@ -2,11 +2,11 @@
 
 </div>
 
-# Run and deploy your app
+# Run and deploy the talk to your PDF app:
 
-This contains everything you need to run your app locally.
+This contains everything you need to run the app locally.
 
-View your app in AI Studio: https://ai.studio/apps/drive/127_eg3UKp2QF8kkOBZ70RbYjWplu4bpZ
+View this app here: https://ai.studio/apps/drive/127_eg3UKp2QF8kkOBZ70RbYjWplu4bpZ
 
 ## Run Locally
 
