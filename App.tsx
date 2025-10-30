@@ -2,10 +2,10 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import type { Source, ChatMessage, SavedNote, Notebook } from './types';
 import { getSummary, getTitleFromSummary, getAnswer, readAloudStream, createLiveSession, createAudioBlob, decodeAudioData, decode } from './services/geminiService';
-import type { LiveServerMessage } from '@google/genai';
+import type { LiveServerMessage } from '@google/ai/generativelanguage';
 import {
     PdfIcon, ChartBarIcon, CheckIcon, PinIcon, SpeakerWaveIcon, MicrophoneIcon,
-    StopCircleIcon, ArrowUpCircleIcon, PencilIcon, TrashIcon
+    StopCircleIcon, ArrowUpCircleIcon, PencilIcon, TrashIcon, ArrowDownTrayIcon, ArrowUpTrayIcon
 } from './components/Icons';
 
 // Helper to convert a File object to a Base64 Data URL for embedding and persistence
@@ -531,19 +531,17 @@ interface RightPanelProps {
     onSelectNotebook: (id: string) => void;
     onRenameNotebook: (id: string, newName: string) => void;
     onDeleteNotebook: (id: string) => void;
+    onSaveNotebooks: () => void;
+    onLoadNotebooks: (file: File) => void;
 }
 const RightPanel: React.FC<RightPanelProps> = (props) => {
     const [activeTab, setActiveTab] = useState<'notes' | 'notebooks'>(props.activeNotebookId ? 'notes' : 'notebooks');
 
-    // This effect ensures the correct tab is shown when the active notebook changes.
-    // Crucially, it does NOT depend on `activeTab`, so manual tab switching is not overridden.
     useEffect(() => {
+        // This effect correctly switches to notes when a notebook becomes active,
+        // but doesn't prevent switching back to the notebooks list.
         if (props.activeNotebookId) {
-            // When a notebook is selected or becomes active, switch to its notes view.
             setActiveTab('notes');
-        } else {
-            // If there's no active notebook, default to the notebook list.
-            setActiveTab('notebooks');
         }
     }, [props.activeNotebookId]);
 
@@ -593,10 +591,11 @@ const SavedNotesList: React.FC<{ items: SavedNote[] }> = ({ items }) => (
 );
 
 // Notebooks List (Sub-component of RightPanel)
-const NotebooksList: React.FC<RightPanelProps> = ({ notebooks, activeNotebookId, onNewNotebook, onSelectNotebook, onRenameNotebook, onDeleteNotebook }) => {
+const NotebooksList: React.FC<RightPanelProps> = ({ notebooks, activeNotebookId, onNewNotebook, onSelectNotebook, onRenameNotebook, onDeleteNotebook, onSaveNotebooks, onLoadNotebooks }) => {
     const [editingId, setEditingId] = useState<string | null>(null);
     const [editingName, setEditingName] = useState('');
     const renameInputRef = useRef<HTMLInputElement>(null);
+    const loadFileInputRef = useRef<HTMLInputElement>(null);
 
     useEffect(() => {
         if (editingId && renameInputRef.current) {
@@ -616,13 +615,45 @@ const NotebooksList: React.FC<RightPanelProps> = ({ notebooks, activeNotebookId,
         setEditingId(null);
         setEditingName('');
     };
+
+    const handleLoadClick = () => {
+        if (loadFileInputRef.current) {
+            loadFileInputRef.current.value = ""; // Reset for re-uploads
+            loadFileInputRef.current.click();
+        }
+    };
+
+    const handleFileLoad = (event: React.ChangeEvent<HTMLInputElement>) => {
+        const file = event.target.files?.[0];
+        if (file) {
+            if (file.name.toLowerCase().endsWith('.json')) {
+                onLoadNotebooks(file);
+            } else {
+                alert('Please upload a valid JSON file (with a .json extension).');
+            }
+        }
+    };
     
     return (
          <div className="flex-1 flex flex-col">
-            <div className='p-4'>
+            <div className='p-4 space-y-2'>
                 <button onClick={onNewNotebook} className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg transition-colors">
                     + New Notebook
                 </button>
+                <div className='flex gap-2 pt-2'>
+                    <input
+                        type="file"
+                        ref={loadFileInputRef}
+                        onChange={handleFileLoad}
+                        className="hidden"
+                    />
+                    <button onClick={onSaveNotebooks} className="flex-1 flex items-center justify-center gap-2 bg-gray-700 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded-lg transition-colors text-sm">
+                        <ArrowDownTrayIcon className="w-4 h-4" /> Save All to File
+                    </button>
+                    <button onClick={handleLoadClick} className="flex-1 flex items-center justify-center gap-2 bg-gray-700 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded-lg transition-colors text-sm">
+                       <ArrowUpTrayIcon className="w-4 h-4" /> Load from File
+                    </button>
+                </div>
             </div>
             <div className="overflow-y-auto p-4 pt-0 space-y-2">
                 {notebooks.length === 0 && <p className="text-center text-gray-500 text-sm">No notebooks yet.</p>}
@@ -658,30 +689,30 @@ const NotebooksList: React.FC<RightPanelProps> = ({ notebooks, activeNotebookId,
 };
 
 type LiveSession = Awaited<ReturnType<typeof createLiveSession>>;
+interface Workspace {
+    notebooks: Notebook[];
+    activeNotebookId: string | null;
+}
 
 // Main App Component
 const App: React.FC = () => {
-    const [notebooks, setNotebooks] = useState<Notebook[]>([]);
-    const [activeNotebookId, setActiveNotebookId] = useState<string | null>(null);
+    const [workspace, setWorkspace] = useState<Workspace>({ notebooks: [], activeNotebookId: null });
     const [isLoading, setIsLoading] = useState(false);
     const [isVoiceMode, setIsVoiceMode] = useState(false);
     const [isListening, setIsListening] = useState(false);
     const [isDocumentViewActive, setIsDocumentViewActive] = useState(false);
     
+    const { notebooks, activeNotebookId } = workspace;
     const activeNotebook = notebooks.find(n => n.id === activeNotebookId) || null;
     
     useEffect(() => {
         try {
-            const savedNotebooks = localStorage.getItem('notebooks');
-            const savedActiveId = localStorage.getItem('activeNotebookId');
-            if (savedNotebooks) {
-                setNotebooks(JSON.parse(savedNotebooks));
-            }
-            if (savedActiveId && savedNotebooks) {
-                const parsedNotebooks = JSON.parse(savedNotebooks);
-                const parsedActiveId = JSON.parse(savedActiveId);
-                if (parsedNotebooks.some((n: Notebook) => n.id === parsedActiveId)) {
-                    setActiveNotebookId(parsedActiveId);
+            const savedData = localStorage.getItem('notebook_workspace');
+            if (savedData) {
+                const loadedWorkspace: Workspace = JSON.parse(savedData);
+                // Basic validation
+                if (loadedWorkspace && Array.isArray(loadedWorkspace.notebooks)) {
+                   setWorkspace(loadedWorkspace);
                 }
             }
         } catch (error) {
@@ -691,51 +722,63 @@ const App: React.FC = () => {
 
     useEffect(() => {
         try {
-            localStorage.setItem('notebooks', JSON.stringify(notebooks));
-            localStorage.setItem('activeNotebookId', JSON.stringify(activeNotebookId));
+            localStorage.setItem('notebook_workspace', JSON.stringify(workspace));
         } catch (error) {
             console.error("Failed to save to localStorage", error);
         }
-    }, [notebooks, activeNotebookId]);
+    }, [workspace]);
 
 
     const handleNewNotebook = () => {
+        const timestamp = new Date();
         const newNotebookTemplate: Notebook = {
             id: crypto.randomUUID(),
-            name: "New Untitled Notebook",
+            name: `Untitled ${timestamp.toLocaleTimeString()}`,
             source: null!, 
             chatHistory: [],
             savedNotes: [],
-            createdAt: new Date().toLocaleDateString()
+            createdAt: timestamp.toLocaleDateString()
         };
-        setNotebooks(prev => [newNotebookTemplate, ...prev]);
-        setActiveNotebookId(newNotebookTemplate.id);
+        setWorkspace(prev => ({
+            notebooks: [newNotebookTemplate, ...prev.notebooks],
+            activeNotebookId: newNotebookTemplate.id
+        }));
         setIsDocumentViewActive(false);
     };
 
     const handleSelectNotebook = (id: string) => {
-        setActiveNotebookId(id);
+        setWorkspace(prev => ({ ...prev, activeNotebookId: id }));
         setIsDocumentViewActive(false);
     };
     const handleRenameNotebook = (id: string, newName: string) => {
-        setNotebooks(prev => prev.map(n => n.id === id ? { ...n, name: newName } : n));
+        setWorkspace(prev => ({
+            ...prev,
+            notebooks: prev.notebooks.map(n => n.id === id ? { ...n, name: newName } : n)
+        }));
     };
     const handleDeleteNotebook = (id: string) => {
         if (window.confirm("Are you sure you want to delete this notebook?")) {
-            const remainingNotebooks = notebooks.filter(n => n.id !== id);
-            setNotebooks(remainingNotebooks);
-            if (activeNotebookId === id) {
-                setActiveNotebookId(remainingNotebooks.length > 0 ? remainingNotebooks[0].id : null);
-                setIsDocumentViewActive(false);
-            }
+            setWorkspace(prev => {
+                const remainingNotebooks = prev.notebooks.filter(n => n.id !== id);
+                const newActiveId = prev.activeNotebookId === id
+                    ? (remainingNotebooks.length > 0 ? remainingNotebooks[0].id : null)
+                    : prev.activeNotebookId;
+                
+                if(prev.activeNotebookId === id) {
+                    setIsDocumentViewActive(false);
+                }
+                return { notebooks: remainingNotebooks, activeNotebookId: newActiveId };
+            });
         }
     };
     
     const handleFileUpload = async (file: File) => {
-        let currentNotebookId = activeNotebookId;
+        let isNewNotebook = false;
+        let notebookToUpdateId = activeNotebookId;
 
         // If there's no active notebook, or the active one already has a source, create one automatically.
-        if (!currentNotebookId || activeNotebook?.source) {
+        if (!notebookToUpdateId || activeNotebook?.source) {
+            isNewNotebook = true;
             const newNotebook: Notebook = {
                 id: crypto.randomUUID(),
                 name: "Processing PDF...",
@@ -744,9 +787,11 @@ const App: React.FC = () => {
                 savedNotes: [],
                 createdAt: new Date().toLocaleDateString(),
             };
-            setNotebooks(prev => [newNotebook, ...prev]);
-            setActiveNotebookId(newNotebook.id);
-            currentNotebookId = newNotebook.id;
+            setWorkspace(prev => ({
+                notebooks: [newNotebook, ...prev.notebooks],
+                activeNotebookId: newNotebook.id
+            }));
+            notebookToUpdateId = newNotebook.id;
         }
 
         setIsLoading(true);
@@ -776,25 +821,33 @@ const App: React.FC = () => {
             const summary = await getSummary(source.content);
             const title = await getTitleFromSummary(summary);
             
-            setNotebooks(prev => prev.map(n => {
-                if (n.id === currentNotebookId) {
-                    return {
-                        ...n,
-                        name: title,
-                        source: source,
-                        chatHistory: [{ id: crypto.randomUUID(), sender: 'ai', text: summary }],
+            setWorkspace(prev => ({
+                ...prev,
+                notebooks: prev.notebooks.map(n => {
+                    if (n.id === notebookToUpdateId) {
+                        return {
+                            ...n,
+                            name: title,
+                            source: source,
+                            chatHistory: [{ id: crypto.randomUUID(), sender: 'ai', text: summary }],
+                        }
                     }
-                }
-                return n;
+                    return n;
+                })
             }));
 
         } catch (error) {
             console.error("Error processing PDF:", error);
             alert("There was an error processing the PDF. It may be corrupted.");
             // Clean up the automatically created notebook on failure
-            setNotebooks(prev => prev.filter(n => n.id !== currentNotebookId));
-            if (activeNotebookId === currentNotebookId) {
-                 setActiveNotebookId(notebooks.length > 1 ? notebooks[0].id : null);
+             if (isNewNotebook) {
+                setWorkspace(prev => {
+                    const remainingNotebooks = prev.notebooks.filter(n => n.id !== notebookToUpdateId);
+                    const newActiveId = prev.activeNotebookId === notebookToUpdateId
+                        ? (notebooks.length > 1 ? notebooks[0].id : null)
+                        : prev.activeNotebookId;
+                    return { notebooks: remainingNotebooks, activeNotebookId: newActiveId };
+                });
             }
         } finally {
             setIsLoading(false);
@@ -812,13 +865,24 @@ const App: React.FC = () => {
         
         const userMessage: ChatMessage = { id: crypto.randomUUID(), sender: 'user', text: message };
         
-        setNotebooks(prev => prev.map(n => n.id === activeNotebookId ? { ...n, chatHistory: [...n.chatHistory, userMessage] } : n));
+        setWorkspace(prev => ({
+            ...prev,
+            notebooks: prev.notebooks.map(n => 
+                n.id === activeNotebookId ? { ...n, chatHistory: [...n.chatHistory, userMessage] } : n
+            )
+        }));
+
         setIsLoading(true);
         
         const answer = await getAnswer(message, activeNotebook.source.content);
         const aiMessage: ChatMessage = { id: crypto.randomUUID(), sender: 'ai', text: answer, question: message };
         
-        setNotebooks(prev => prev.map(n => n.id === activeNotebookId ? { ...n, chatHistory: [...n.chatHistory, aiMessage] } : n));
+        setWorkspace(prev => ({
+            ...prev,
+            notebooks: prev.notebooks.map(n =>
+                n.id === activeNotebookId ? { ...n, chatHistory: [...n.chatHistory, aiMessage] } : n
+            )
+        }));
         setIsLoading(false);
     };
 
@@ -833,14 +897,17 @@ const App: React.FC = () => {
             timestamp: new Date().toLocaleDateString()
         };
         
-        setNotebooks(prev => prev.map(n => {
-            if (n.id === activeNotebookId) {
-                const updatedHistory = n.chatHistory.map(msg => msg.id === messageId ? {...msg, isPinned: true} : msg);
-                const noteExists = n.savedNotes.some(note => note.id === messageId);
-                const updatedNotes = noteExists ? n.savedNotes : [newNote, ...n.savedNotes];
-                return { ...n, chatHistory: updatedHistory, savedNotes: updatedNotes };
-            }
-            return n;
+        setWorkspace(prev => ({
+            ...prev,
+            notebooks: prev.notebooks.map(n => {
+                if (n.id === activeNotebookId) {
+                    const updatedHistory = n.chatHistory.map(msg => msg.id === messageId ? {...msg, isPinned: true} : msg);
+                    const noteExists = n.savedNotes.some(note => note.id === messageId);
+                    const updatedNotes = noteExists ? n.savedNotes : [newNote, ...n.savedNotes];
+                    return { ...n, chatHistory: updatedHistory, savedNotes: updatedNotes };
+                }
+                return n;
+            })
         }));
     };
     
@@ -942,6 +1009,59 @@ const App: React.FC = () => {
     const toggleVoiceMode = () => { isVoiceMode ? stopVoiceMode() : startVoiceMode(); };
     useEffect(() => () => stopVoiceMode(), [stopVoiceMode]);
 
+    const handleSaveNotebooks = () => {
+        if (notebooks.length === 0) {
+            alert("There are no notebooks to save.");
+            return;
+        }
+        try {
+            const pdfDataMissing = workspace.notebooks.some(n => n.source && (!n.source.fileDataUrl || n.source.fileDataUrl.length < 100));
+            if (pdfDataMissing) {
+                alert("Error: Some PDF data appears to be missing. Cannot save correctly. Please try reloading the page and your file.");
+                return;
+            }
+
+            const dataStr = JSON.stringify(workspace, null, 2); 
+            const dataBlob = new Blob([dataStr], { type: "application/json" });
+            const url = URL.createObjectURL(dataBlob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = `notebooks-export-${new Date().toISOString().slice(0, 10)}.json`;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+        } catch (error) {
+            console.error("Failed to save notebooks:", error);
+            alert("An error occurred while trying to save the notebooks.");
+        }
+    };
+
+    const handleLoadNotebooks = (file: File) => {
+        const reader = new FileReader();
+        reader.onload = (event) => {
+            try {
+                const content = event.target?.result;
+                if (typeof content !== 'string') throw new Error("File content is not valid.");
+                
+                const loadedWorkspace: Workspace = JSON.parse(content);
+                
+                if (loadedWorkspace && Array.isArray(loadedWorkspace.notebooks) && typeof loadedWorkspace.activeNotebookId !== 'undefined') {
+                    setWorkspace(loadedWorkspace);
+                    setIsDocumentViewActive(false);
+                } else {
+                    throw new Error("JSON file is not in the correct format. It should be an object with a 'notebooks' array and an 'activeNotebookId'.");
+                }
+            } catch (error) {
+                alert(`Error loading file: ${(error as Error).message}`);
+            }
+        };
+        reader.onerror = () => {
+            alert("Failed to read the selected file.");
+        };
+        reader.readAsText(file);
+    };
+
     return (
         <div className="h-screen w-screen p-4 bg-gray-800 text-gray-200">
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 h-full">
@@ -981,6 +1101,8 @@ const App: React.FC = () => {
                     onSelectNotebook={handleSelectNotebook}
                     onRenameNotebook={handleRenameNotebook}
                     onDeleteNotebook={handleDeleteNotebook}
+                    onSaveNotebooks={handleSaveNotebooks}
+                    onLoadNotebooks={handleLoadNotebooks}
                 />
             </div>
         </div>
