@@ -1,9 +1,9 @@
 
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import type { Source, ChatMessage, SavedNote, Notebook } from './types';
-import { getSummary, getTitleFromSummary, getAnswer, readAloudStream, createLiveSession, createAudioBlob, decodeAudioData, decode } from './services/geminiService';
-import { savePdfData, getPdfData, deletePdfData } from './services/db';
-import type { LiveServerMessage } from '@google/genai';
+import { getSummary, getTitleFromSummary, createChatSession, readAloudStream, LiveSessionManager, decodeAudioData, decode } from './services/geminiService';
+import { savePdfData, getPdfData, deletePdfData, clearAllPdfData } from './services/db';
+import type { LiveServerMessage, Chat } from '@google/genai';
 import {
     PdfIcon, ChartBarIcon, CheckIcon, PinIcon, SpeakerWaveIcon, MicrophoneIcon,
     StopCircleIcon, ArrowUpCircleIcon, PencilIcon, TrashIcon, ArrowDownTrayIcon, ArrowUpTrayIcon
@@ -108,166 +108,154 @@ const SourcesPanel: React.FC<SourcesPanelProps> = ({ source, onFilePicked, isLoa
 // Document Viewer Panel Component using PDF.js
 interface DocumentViewerPanelProps {
     source: Source & { fileDataUrl: string }; // fileDataUrl is guaranteed here
+    isVisible: boolean;
 }
-const DocumentViewerPanel: React.FC<DocumentViewerPanelProps> = ({ source }) => {
+const DocumentViewerPanel: React.FC<DocumentViewerPanelProps> = ({ source, isVisible }) => {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
+    const renderTaskRef = useRef<any | null>(null);
+
     const [pdfDoc, setPdfDoc] = useState<any | null>(null);
     const [pageNum, setPageNum] = useState(1);
     const [numPages, setNumPages] = useState(0);
-    const [scale, setScale] = useState(1.0);
+    const [scale, setScale] = useState<number>(0.73); // Always start at 73% zoom
     const [error, setError] = useState<string | null>(null);
+    const [isReady, setIsReady] = useState(false); // Controls visibility and loading state
 
-    // Unified state for UI: loading document, rendering page, or ready/idle.
-    const [viewState, setViewState] = useState<'loading' | 'rendering' | 'ready'>('loading');
-    const isRendering = viewState === 'rendering'; // Derived state for disabling controls
-
-    // Effect to load the PDF document from the source data
+    // 1. Effect to load the PDF document object when the source changes.
     useEffect(() => {
-        setViewState('loading');
+        // Reset all state for the new source
+        setIsReady(false);
         setPdfDoc(null);
+        setScale(0.73); // Always reset to 73% for new documents
+        setPageNum(1);
+        setNumPages(0);
+        setError(null);
+        if (renderTaskRef.current) {
+            renderTaskRef.current.cancel();
+            renderTaskRef.current = null;
+        }
 
+        if (!source?.fileDataUrl) return;
+
+        let isSubscribed = true;
         const loadPdf = async () => {
-            if (!source?.fileDataUrl) return;
-
-            const pdfjsLib = (window as any).pdfjsLib;
-            if (!pdfjsLib) {
-                setError("PDF.js library is not loaded.");
-                setViewState('ready');
-                return;
-            }
-            
-            pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js`;
-            
             try {
+                const pdfjsLib = (window as any).pdfjsLib;
+                if (!pdfjsLib) throw new Error("PDF.js library is not loaded.");
+                pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js`;
+
                 const pdfData = atob(source.fileDataUrl.split(',')[1]);
-                const pdfBytes = new Uint8Array(pdfData.length).map((_, i) => pdfData.charCodeAt(i));
-                const loadingTask = pdfjsLib.getDocument({ data: pdfBytes });
-                const doc = await loadingTask.promise;
-                setPdfDoc(doc);
-                setNumPages(doc.numPages);
-                setPageNum(1);
-                setError(null);
+                const doc = await pdfjsLib.getDocument({ data: new Uint8Array(pdfData.split('').map(c => c.charCodeAt(0))) }).promise;
+                if (isSubscribed) {
+                    setPdfDoc(doc);
+                    setNumPages(doc.numPages);
+                }
             } catch (err) {
                 console.error('Error loading PDF:', err);
-                setError("Failed to load PDF. The file might be corrupted.");
-                setPdfDoc(null);
-                setViewState('ready');
+                if (isSubscribed) setError("Failed to load the PDF. It might be corrupted.");
             }
         };
 
         loadPdf();
+        return () => { isSubscribed = false; };
     }, [source]);
 
-    // This callback performs the actual rendering on the canvas. It's simplified to just render.
-    const renderPage = useCallback(async (doc: any, num: number, currentScale: number) => {
-        const page = await doc.getPage(num);
-        const canvas = canvasRef.current;
-        if (!canvas) return;
-        
-        const viewport = page.getViewport({ scale: currentScale });
-        const context = canvas.getContext('2d');
-        if (!context) return;
-        
-        canvas.height = viewport.height;
-        canvas.width = viewport.width;
-
-        context.fillStyle = 'white';
-        context.fillRect(0, 0, canvas.width, canvas.height);
-
-        const renderContext = {
-            canvasContext: context,
-            viewport: viewport,
-            renderInteractiveForms: false,
-            background: 'rgba(255,255,255,1)',
-        };
-        await page.render(renderContext).promise;
-    }, []);
-    
-    // Main effect for scaling and rendering. Handles initial load, page changes, and container resizing.
+    // 2. Effect to render the PDF page when the doc, page, or scale changes.
     useEffect(() => {
-        if (!pdfDoc || !containerRef.current) return;
+        if (!pdfDoc) return;
 
         let isMounted = true;
-        const container = containerRef.current;
+        
+        const renderPage = async () => {
+            if (!pdfDoc || !isMounted) return;
 
-        const scaleAndRender = async () => {
-            // Guard against rendering when the container has no size yet, preventing flicker/errors.
-            if (!isMounted || !containerRef.current || containerRef.current.clientWidth === 0) {
-                return;
+            // Hide canvas while rendering to prevent showing old content
+            setIsReady(false);
+
+            if (renderTaskRef.current) {
+                renderTaskRef.current.cancel();
             }
-            
-            setViewState('rendering');
 
             try {
                 const page = await pdfDoc.getPage(pageNum);
-                if (!containerRef.current || !isMounted) return;
-
-                const viewport = page.getViewport({ scale: 1 });
-                const newScale = Math.min(
-                    containerRef.current.clientWidth / viewport.width,
-                    containerRef.current.clientHeight / viewport.height
-                ) * 0.95; // 5% padding
+                const viewport = page.getViewport({ scale: scale });
+                const canvas = canvasRef.current;
+                if (!canvas) return;
                 
-                setScale(newScale);
-
-                await renderPage(pdfDoc, pageNum, newScale);
+                const context = canvas.getContext('2d');
+                if (!context) return;
                 
-                if(isMounted) {
-                    setError(null); // Clear any previous errors on a successful render
-                    setViewState('ready');
+                canvas.height = viewport.height;
+                canvas.width = viewport.width;
+
+                const renderContext = { canvasContext: context, viewport };
+                const task = page.render(renderContext);
+                renderTaskRef.current = task;
+                await task.promise;
+                
+                if (isMounted) {
+                    setIsReady(true); // Reveal the canvas when rendering is complete
                 }
-            } catch (err) {
-                console.error('Error during render:', err);
+            } catch (err: any) {
+                if (isMounted && err.name !== 'RenderingCancelledException') {
+                    console.error("Failed to render page:", err);
+                    setError("An error occurred while rendering the page.");
+                }
+            } finally {
                  if (isMounted) {
-                    setError("Failed to render the page.");
-                    setViewState('ready'); // Exit rendering state even on error
-                }
+                    renderTaskRef.current = null;
+                 }
             }
         };
-        
-        const observer = new ResizeObserver(scaleAndRender);
-        observer.observe(container);
 
-        return () => {
-            isMounted = false;
-            if(container) observer.unobserve(container);
-        };
-    }, [pdfDoc, pageNum, renderPage]);
-    
+        renderPage();
+
+        return () => { isMounted = false; };
+    }, [pdfDoc, pageNum, scale]);
+
     const goToPrevPage = () => setPageNum(prev => Math.max(1, prev - 1));
     const goToNextPage = () => setPageNum(prev => Math.min(numPages, prev + 1));
-    const zoomIn = () => setScale(prev => prev + 0.1);
-    const zoomOut = () => setScale(prev => Math.max(0.1, prev - 0.1));
+    const zoomIn = () => setScale(prev => prev * 1.2);
+    const zoomOut = () => setScale(prev => Math.max(0.1, prev / 1.2));
+    
+    const isBusy = !isReady || !pdfDoc;
 
     return (
-        <div className="flex flex-col bg-gray-800 h-full rounded-lg border border-gray-700">
+        <div className={`flex flex-col bg-gray-800 h-full rounded-lg border border-gray-700 transition-opacity duration-500 ${isVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
             <PanelHeader title="Document Viewer" />
             {pdfDoc && (
                 <div className="flex items-center justify-center p-2 bg-gray-900/90 border-b border-gray-700 gap-4 text-sm sticky top-0 z-10">
-                    <button onClick={goToPrevPage} disabled={pageNum <= 1 || isRendering} className="px-3 py-1 rounded disabled:opacity-50 hover:bg-gray-700 transition-colors">Previous</button>
+                    <button onClick={goToPrevPage} disabled={pageNum <= 1 || isBusy} className="px-3 py-1 rounded disabled:opacity-50 hover:bg-gray-700 transition-colors">Previous</button>
                     <span className="font-mono">Page {pageNum} of {numPages}</span>
-                    <button onClick={goToNextPage} disabled={pageNum >= numPages || isRendering} className="px-3 py-1 rounded disabled:opacity-50 hover:bg-gray-700 transition-colors">Next</button>
+                    <button onClick={goToNextPage} disabled={pageNum >= numPages || isBusy} className="px-3 py-1 rounded disabled:opacity-50 hover:bg-gray-700 transition-colors">Next</button>
                     <div className="ml-6 border-l border-gray-600 pl-4 flex items-center gap-2">
-                        <button onClick={zoomOut} disabled={isRendering} className="px-3 py-1 rounded disabled:opacity-50 hover:bg-gray-700 transition-colors">Zoom -</button>
+                        <button onClick={zoomOut} disabled={isBusy} className="px-3 py-1 rounded disabled:opacity-50 hover:bg-gray-700 transition-colors">Zoom -</button>
                         <span className="font-mono text-xs w-12 text-center">{(scale * 100).toFixed(0)}%</span>
-                        <button onClick={zoomIn} disabled={isRendering} className="px-3 py-1 rounded disabled:opacity-50 hover:bg-gray-700 transition-colors">Zoom +</button>
+                        <button onClick={zoomIn} disabled={isBusy} className="px-3 py-1 rounded disabled:opacity-50 hover:bg-gray-700 transition-colors">Zoom +</button>
                     </div>
                 </div>
             )}
-            <div ref={containerRef} className="flex-1 overflow-auto p-4 flex justify-center items-center bg-gray-900/50">
-                <div className='relative'>
-                    {viewState !== 'ready' && (
-                        <div className="absolute inset-0 flex items-center justify-center text-gray-400">
-                             <p>{error || (viewState === 'loading' ? "Loading document..." : "Rendering page...")}</p>
-                        </div>
-                    )}
-                    <canvas ref={canvasRef} className={`rounded-md shadow-lg ${viewState !== 'ready' ? 'opacity-20' : 'opacity-100'} transition-opacity`}></canvas>
-                </div>
+            <div ref={containerRef} className="flex-1 overflow-auto p-4 flex justify-center items-start bg-gray-900/50 relative">
+                {(!pdfDoc || !isVisible) && !error && (
+                    <div className="absolute inset-0 flex items-center justify-center text-gray-400">
+                         <p>Preparing document preview...</p>
+                    </div>
+                )}
+                 {error && (
+                     <div className="absolute inset-0 flex items-center justify-center text-red-400 p-4 text-center">
+                         <p>{error}</p>
+                    </div>
+                )}
+                <canvas 
+                    ref={canvasRef} 
+                    className={`rounded-md shadow-lg transition-opacity duration-300 ${isReady ? 'opacity-100' : 'opacity-0'}`}
+                />
             </div>
         </div>
     );
 };
+
 
 // This code runs in a separate thread and is responsible for processing audio data.
 const audioWorkletProcessorCode = `
@@ -341,8 +329,12 @@ interface ChatPanelProps {
     toggleVoiceMode: () => void;
     isListening: boolean;
     notebookName: string | null;
+    language: string;
+    onLanguageChange: (lang: string) => void;
+    liveUserMessage: string | null;
+    liveAiMessage: string | null;
 }
-const ChatPanel: React.FC<ChatPanelProps> = ({ chatHistory, onSendMessage, onPinMessage, isLoading, source, isVoiceMode, toggleVoiceMode, isListening, notebookName }) => {
+const ChatPanel: React.FC<ChatPanelProps> = ({ chatHistory, onSendMessage, onPinMessage, isLoading, source, isVoiceMode, toggleVoiceMode, isListening, notebookName, language, onLanguageChange, liveUserMessage, liveAiMessage }) => {
     const [input, setInput] = useState('');
     const chatEndRef = useRef<HTMLDivElement>(null);
     const [playingMessageId, setPlayingMessageId] = useState<string | null>(null);
@@ -354,7 +346,7 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ chatHistory, onSendMessage, onPin
     
     useEffect(() => {
         chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }, [chatHistory]);
+    }, [chatHistory, liveUserMessage, liveAiMessage]);
 
     const stopPlayback = useCallback(() => {
         abortControllerRef.current?.abort();
@@ -454,6 +446,24 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ chatHistory, onSendMessage, onPin
         }
     };
     
+    const LanguageSelector = () => (
+        <div className="relative w-40">
+            <select
+                value={language}
+                onChange={(e) => onLanguageChange(e.target.value)}
+                className="bg-gray-700 border-none text-white text-xs rounded-md focus:ring-blue-500 focus:border-blue-500 block w-full p-2 appearance-none transition-colors hover:bg-gray-600"
+                aria-label="Select speech language"
+                title="Select speech language"
+            >
+                <option value="en-US">English (US)</option>
+                <option value="pt-BR">Português (Brasil)</option>
+                <option value="es-ES">Español (España)</option>
+                <option value="fr-FR">Français (France)</option>
+                <option value="de-DE">Deutsch (Deutschland)</option>
+            </select>
+        </div>
+    );
+
     const chatInputArea = isVoiceMode ? (
          <div className="flex items-center justify-center p-4 bg-gray-900 rounded-b-lg border-t border-gray-700 h-[120px]">
             <button onClick={toggleVoiceMode} className={`flex items-center justify-center w-20 h-20 rounded-full transition-colors ${isListening ? 'bg-red-500 hover:bg-red-600 animate-pulse' : 'bg-blue-600 hover:bg-blue-700'}`}>
@@ -486,7 +496,9 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ chatHistory, onSendMessage, onPin
 
     return (
         <div className="flex flex-col bg-gray-800 h-full rounded-lg border border-gray-700">
-        <PanelHeader title="Chat" />
+        <PanelHeader title="Chat">
+            <LanguageSelector />
+        </PanelHeader>
         <div className="flex-1 overflow-y-auto p-6 space-y-6">
             {!source && (
                  <div className="text-center text-gray-400">Create a new notebook or select an existing one to begin.</div>
@@ -531,7 +543,21 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ chatHistory, onSendMessage, onPin
                 </div>
             </div>
             ))}
-            {isLoading && <div className="text-center text-gray-400">Gemini is thinking...</div>}
+            {isLoading && !isVoiceMode && <div className="text-center text-gray-400">Gemini is thinking...</div>}
+            {liveUserMessage && (
+                <div className="flex justify-end" aria-live="polite">
+                    <div className="max-w-xl rounded-lg px-4 py-3 bg-blue-600 text-white opacity-90">
+                        <p className="text-base">{liveUserMessage}<span className="inline-block w-2 h-4 bg-white ml-1 animate-pulse"></span></p>
+                    </div>
+                </div>
+            )}
+            {liveAiMessage && (
+                <div className="flex justify-start" aria-live="polite">
+                    <div className="max-w-xl rounded-lg px-4 py-3 bg-gray-700 opacity-90">
+                        <p className="text-base">{liveAiMessage}<span className="inline-block w-2 h-4 bg-gray-300 ml-1 animate-pulse"></span></p>
+                    </div>
+                </div>
+            )}
             <div ref={chatEndRef} />
         </div>
         {chatInputArea}
@@ -551,6 +577,7 @@ interface RightPanelProps {
     onDeleteNotebook: (id: string) => void;
     onSaveNotebooks: () => void;
     onLoadNotebooks: (file: File) => void;
+    onClearAllNotebooks: () => void;
 }
 const RightPanel: React.FC<RightPanelProps> = (props) => {
     const [activeTab, setActiveTab] = useState<'notes' | 'notebooks'>(props.activeNotebookId ? 'notes' : 'notebooks');
@@ -609,7 +636,7 @@ const SavedNotesList: React.FC<{ items: SavedNote[] }> = ({ items }) => (
 );
 
 // Notebooks List (Sub-component of RightPanel)
-const NotebooksList: React.FC<RightPanelProps> = ({ notebooks, activeNotebookId, onNewNotebook, onSelectNotebook, onRenameNotebook, onDeleteNotebook, onSaveNotebooks, onLoadNotebooks }) => {
+const NotebooksList: React.FC<RightPanelProps> = ({ notebooks, activeNotebookId, onNewNotebook, onSelectNotebook, onRenameNotebook, onDeleteNotebook, onSaveNotebooks, onLoadNotebooks, onClearAllNotebooks }) => {
     const [editingId, setEditingId] = useState<string | null>(null);
     const [editingName, setEditingName] = useState('');
     const renameInputRef = useRef<HTMLInputElement>(null);
@@ -657,6 +684,9 @@ const NotebooksList: React.FC<RightPanelProps> = ({ notebooks, activeNotebookId,
             <div className='p-4 space-y-2'>
                 <button onClick={onNewNotebook} className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg transition-colors">
                     + New Notebook
+                </button>
+                 <button onClick={onClearAllNotebooks} className="w-full bg-red-800 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-lg transition-colors disabled:bg-gray-700 disabled:cursor-not-allowed" disabled={notebooks.length === 0}>
+                    Clear All Notebooks
                 </button>
                 <div className='flex gap-2 pt-2'>
                     <input
@@ -707,11 +737,36 @@ const NotebooksList: React.FC<RightPanelProps> = ({ notebooks, activeNotebookId,
     );
 };
 
-type LiveSession = Awaited<ReturnType<typeof createLiveSession>>;
 interface Workspace {
     notebooks: Notebook[];
     activeNotebookId: string | null;
 }
+
+// Confirmation Dialog Component
+interface ConfirmationDialogProps {
+    isOpen: boolean;
+    title: string;
+    message: string;
+    onConfirm: () => void;
+    onCancel: () => void;
+}
+const ConfirmationDialog: React.FC<ConfirmationDialogProps> = ({ isOpen, title, message, onConfirm, onCancel }) => {
+    if (!isOpen) return null;
+
+    return (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" aria-modal="true" role="dialog">
+            <div className="bg-gray-800 rounded-lg shadow-xl p-6 w-full max-w-sm border border-gray-700">
+                <h3 className="text-lg font-bold mb-2">{title}</h3>
+                <p className="text-gray-300 mb-6">{message}</p>
+                <div className="flex justify-end gap-3">
+                    <button onClick={onCancel} className="px-4 py-2 rounded-md bg-gray-600 hover:bg-gray-500 transition-colors">Cancel</button>
+                    <button onClick={onConfirm} className="px-4 py-2 rounded-md bg-red-700 hover:bg-red-600 transition-colors">Confirm</button>
+                </div>
+            </div>
+        </div>
+    );
+};
+
 
 // Main App Component
 const App: React.FC = () => {
@@ -721,6 +776,15 @@ const App: React.FC = () => {
     const [isListening, setIsListening] = useState(false);
     const [isDocumentViewActive, setIsDocumentViewActive] = useState(false);
     const [activePdfDataUrl, setActivePdfDataUrl] = useState<string | null>(null);
+    const [language, setLanguage] = useState('en-US');
+    const [liveUserMessage, setLiveUserMessage] = useState<string | null>(null);
+    const [liveAiMessage, setLiveAiMessage] = useState<string | null>(null);
+    
+
+    // State for the confirmation dialog
+    const [dialogState, setDialogState] = useState({ isOpen: false, title: '', message: '', onConfirm: () => {} });
+
+    const chatSessionsRef = useRef<Map<string, Chat>>(new Map());
 
     const { notebooks, activeNotebookId } = workspace;
     const activeNotebook = notebooks.find(n => n.id === activeNotebookId) || null;
@@ -785,23 +849,59 @@ const App: React.FC = () => {
             notebooks: prev.notebooks.map(n => n.id === id ? { ...n, name: newName } : n)
         }));
     };
+
+    const confirmAction = (title: string, message: string, onConfirm: () => void) => {
+        setDialogState({ isOpen: true, title, message, onConfirm });
+    };
+
+    const closeDialog = () => {
+        setDialogState(prev => ({ ...prev, isOpen: false }));
+    };
+
     const handleDeleteNotebook = (id: string) => {
-        if (window.confirm("Are you sure you want to delete this notebook?")) {
-            // Also delete the persisted file data
-            deletePdfData(id).catch(err => console.error("Could not delete PDF data:", err));
-            
-            setWorkspace(prev => {
-                const remainingNotebooks = prev.notebooks.filter(n => n.id !== id);
-                const newActiveId = prev.activeNotebookId === id
-                    ? (remainingNotebooks.length > 0 ? remainingNotebooks[0].id : null)
-                    : prev.activeNotebookId;
+        confirmAction(
+            "Delete Notebook?",
+            "Are you sure you want to permanently delete this notebook and all its content?",
+            () => {
+                deletePdfData(id).catch(err => console.error("Could not delete PDF data:", err));
+                chatSessionsRef.current.delete(id);
                 
-                if(prev.activeNotebookId === id) {
+                setWorkspace(prev => {
+                    const remainingNotebooks = prev.notebooks.filter(n => n.id !== id);
+                    const newActiveId = prev.activeNotebookId === id
+                        ? (remainingNotebooks.length > 0 ? remainingNotebooks[0].id : null)
+                        : prev.activeNotebookId;
+                    
+                    if(prev.activeNotebookId === id) setIsDocumentViewActive(false);
+                    return { notebooks: remainingNotebooks, activeNotebookId: newActiveId };
+                });
+                closeDialog();
+            }
+        );
+    };
+
+    const handleClearAllNotebooks = () => {
+        confirmAction(
+            "Clear All Notebooks?",
+            "This will permanently delete all notebooks, sources, and notes. This action cannot be undone.",
+            async () => {
+                setIsLoading(true);
+                closeDialog();
+                try {
+                    await clearAllPdfData();
+                    chatSessionsRef.current.clear();
+                    localStorage.removeItem('notebook_workspace');
+                    setWorkspace({ notebooks: [], activeNotebookId: null });
+                    setActivePdfDataUrl(null);
                     setIsDocumentViewActive(false);
+                } catch (error) {
+                    console.error("Failed to clear all notebooks:", error);
+                    alert("An error occurred while clearing the notebooks.");
+                } finally {
+                    setIsLoading(false);
                 }
-                return { notebooks: remainingNotebooks, activeNotebookId: newActiveId };
-            });
-        }
+            }
+        );
     };
     
     const handleFilePicked = async (file: File) => {
@@ -857,6 +957,13 @@ const App: React.FC = () => {
 
             const summary = await getSummary(source.content);
             const title = await getTitleFromSummary(summary);
+            const initialChatHistory: ChatMessage[] = [{ id: crypto.randomUUID(), sender: 'ai', text: summary }];
+
+            // Create and cache the chat session immediately
+            if (notebookToUpdateId) {
+                const chat = createChatSession(source.content, initialChatHistory);
+                chatSessionsRef.current.set(notebookToUpdateId, chat);
+            }
             
             setWorkspace(prev => ({
                 ...prev,
@@ -866,7 +973,7 @@ const App: React.FC = () => {
                             ...n,
                             name: title,
                             source: source,
-                            chatHistory: [{ id: crypto.randomUUID(), sender: 'ai', text: summary }],
+                            chatHistory: initialChatHistory,
                         }
                     }
                     return n;
@@ -924,16 +1031,38 @@ const App: React.FC = () => {
 
         setIsLoading(true);
         
-        const answer = await getAnswer(message, activeNotebook.source.content);
-        const aiMessage: ChatMessage = { id: crypto.randomUUID(), sender: 'ai', text: answer, question: message };
-        
-        setWorkspace(prev => ({
-            ...prev,
-            notebooks: prev.notebooks.map(n =>
-                n.id === activeNotebookId ? { ...n, chatHistory: [...n.chatHistory, aiMessage] } : n
-            )
-        }));
-        setIsLoading(false);
+        try {
+            let chat = chatSessionsRef.current.get(activeNotebook.id);
+
+            // Lazy-load chat session if it doesn't exist (e.g., after loading from file)
+            if (!chat) {
+                chat = createChatSession(activeNotebook.source.content, activeNotebook.chatHistory);
+                chatSessionsRef.current.set(activeNotebook.id, chat);
+            }
+            
+            const response = await chat.sendMessage({ message });
+            const answer = response.text;
+
+            const aiMessage: ChatMessage = { id: crypto.randomUUID(), sender: 'ai', text: answer, question: message };
+            setWorkspace(prev => ({
+                ...prev,
+                notebooks: prev.notebooks.map(n =>
+                    n.id === activeNotebookId ? { ...n, chatHistory: [...n.chatHistory, aiMessage] } : n
+                )
+            }));
+        } catch (error) {
+            console.error("Error sending message:", error);
+            const errorMessage = "Sorry, I encountered an error trying to answeryour question.";
+            const aiMessage: ChatMessage = { id: crypto.randomUUID(), sender: 'ai', text: errorMessage, question: message };
+            setWorkspace(prev => ({
+                ...prev,
+                notebooks: prev.notebooks.map(n =>
+                    n.id === activeNotebookId ? { ...n, chatHistory: [...n.chatHistory, aiMessage] } : n
+                )
+            }));
+        } finally {
+            setIsLoading(false);
+        }
     };
 
     const handlePinMessage = (messageId: string, question: string, answer: string) => {
@@ -961,150 +1090,148 @@ const App: React.FC = () => {
         }));
     };
     
-    const liveSessionRef = useRef<LiveSession | null>(null);
-    const inputAudioContextRef = useRef<AudioContext | null>(null);
+    const liveSessionRef = useRef<LiveSessionManager | null>(null);
     const outputAudioContextRef = useRef<AudioContext | null>(null);
-    const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
-    const mediaStreamSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
     const audioSourceNodesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
-    const currentInputTranscriptionRef = useRef('');
-    const currentOutputTranscriptionRef = useRef('');
-
-
+    
     const stopVoiceMode = useCallback(() => {
         setIsListening(false);
         setIsVoiceMode(false);
-
-        liveSessionRef.current?.close();
-        liveSessionRef.current = null;
-        
-        scriptProcessorRef.current?.disconnect();
-        scriptProcessorRef.current = null;
-
-        mediaStreamSourceRef.current?.disconnect();
-        mediaStreamSourceRef.current = null;
-
-        audioSourceNodesRef.current.forEach(source => source.stop());
-        audioSourceNodesRef.current.clear();
     }, []);
 
-    const startVoiceMode = useCallback(async () => {
+    const startVoiceMode = useCallback(() => {
         if (!activeNotebook?.source?.content) {
             alert("Please add a document to a notebook before starting voice mode.");
             return;
         }
-
         setIsVoiceMode(true);
         setIsListening(true);
-        let nextStartTime = 0;
+    }, [activeNotebook?.source?.content]);
 
+    const toggleVoiceMode = () => { isListening ? stopVoiceMode() : startVoiceMode(); };
+
+    // This effect manages the entire lifecycle of the voice session
+    useEffect(() => {
+        if (!isListening) {
+            liveSessionRef.current?.stop();
+            liveSessionRef.current = null;
+
+            audioSourceNodesRef.current.forEach(source => source.stop());
+            audioSourceNodesRef.current.clear();
+
+            if (outputAudioContextRef.current && outputAudioContextRef.current.state !== 'closed') {
+                outputAudioContextRef.current.close().catch(console.error);
+                outputAudioContextRef.current = null;
+            }
+            
+            setLiveUserMessage(null);
+            setLiveAiMessage(null);
+            return;
+        }
+
+        if (!activeNotebook?.source?.content) {
+            setIsListening(false);
+            return;
+        }
+        
+        const session = new LiveSessionManager();
+        liveSessionRef.current = session;
+        
+        const currentInputTranscriptionRef = { current: '' };
+        const currentOutputTranscriptionRef = { current: '' };
+        
+        let nextStartTime = 0;
         if (!outputAudioContextRef.current || outputAudioContextRef.current.state === 'closed') {
             outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
         }
-        if (!inputAudioContextRef.current || inputAudioContextRef.current.state === 'closed') {
-            inputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-        }
+        const outputCtx = outputAudioContextRef.current;
 
-        try {
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-            const sessionPromise = createLiveSession(
-                async (message: LiveServerMessage) => {
-                    // 1. Handle audio playback
-                    const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-                    if (base64Audio && outputAudioContextRef.current) {
-                        const outputCtx = outputAudioContextRef.current;
-                        if(outputCtx.state === 'suspended') await outputCtx.resume();
-                        
-                        nextStartTime = Math.max(nextStartTime, outputCtx.currentTime);
-                        const audioData = decode(base64Audio);
-                        const audioBuffer = await decodeAudioData(audioData, outputCtx, 24000, 1);
-                        
-                        const sourceNode = outputCtx.createBufferSource();
-                        sourceNode.buffer = audioBuffer;
-                        sourceNode.connect(outputCtx.destination);
-                        
-                        sourceNode.onended = () => audioSourceNodesRef.current.delete(sourceNode);
-                        sourceNode.start(nextStartTime);
-                        nextStartTime += audioBuffer.duration;
-                        audioSourceNodesRef.current.add(sourceNode);
-                    }
-
-                    // 2. Handle transcription
-                    if (message.serverContent?.inputTranscription) {
-                        currentInputTranscriptionRef.current += message.serverContent.inputTranscription.text;
-                    }
-                    if (message.serverContent?.outputTranscription) {
-                        currentOutputTranscriptionRef.current += message.serverContent.outputTranscription.text;
-                    }
-
-                    // 3. Handle turn completion to update chat history
-                    if (message.serverContent?.turnComplete) {
-                        const finalInput = currentInputTranscriptionRef.current.trim();
-                        const finalOutput = currentOutputTranscriptionRef.current.trim();
-
-                        if (finalInput) { // Only update if the user actually spoke
-                             const userInput: ChatMessage = {
-                                id: crypto.randomUUID(),
-                                sender: 'user',
-                                text: finalInput,
-                            };
-                            const aiResponse: ChatMessage = {
-                                id: crypto.randomUUID(),
-                                sender: 'ai',
-                                text: finalOutput,
-                                question: finalInput,
-                            };
-
-                            setWorkspace(prev => ({
-                                ...prev,
-                                notebooks: prev.notebooks.map(n =>
-                                    n.id === activeNotebookId
-                                        ? { ...n, chatHistory: [...n.chatHistory, userInput, aiResponse] }
-                                        : n
-                                )
-                            }));
-                        }
-                        
-                        // Reset for the next turn
-                        currentInputTranscriptionRef.current = '';
-                        currentOutputTranscriptionRef.current = '';
-                    }
-                },
-                (error) => { console.error("Live session error:", error); stopVoiceMode(); },
-                () => { console.log("Live session closed."); stopVoiceMode(); }
-            );
-
-            liveSessionRef.current = await sessionPromise;
-            liveSessionRef.current.sendRealtimeInput({
-                text: `CONTEXT: The user has uploaded a document with the following content. Base your answers on this. Do not mention the context in your response. CONTENT: ${activeNotebook.source.content}`
-            });
+        const handleAudioChunk = async (audioData: Uint8Array) => {
+            if (!outputCtx) return;
+            if (outputCtx.state === 'suspended') await outputCtx.resume();
             
-            const inputCtx = inputAudioContextRef.current;
-            if (inputCtx) {
-                mediaStreamSourceRef.current = inputCtx.createMediaStreamSource(stream);
-                scriptProcessorRef.current = inputCtx.createScriptProcessor(4096, 1, 1);
-                
-                scriptProcessorRef.current.onaudioprocess = (e) => {
-                    const inputData = e.inputBuffer.getChannelData(0);
-                    sessionPromise.then((session) => {
-                        session.sendRealtimeInput({ media: createAudioBlob(inputData) });
-                    });
-                };
+            nextStartTime = Math.max(nextStartTime, outputCtx.currentTime);
+            const audioBuffer = await decodeAudioData(audioData, outputCtx, 24000, 1);
+            
+            const sourceNode = outputCtx.createBufferSource();
+            sourceNode.buffer = audioBuffer;
+            sourceNode.connect(outputCtx.destination);
+            
+            sourceNode.onended = () => audioSourceNodesRef.current.delete(sourceNode);
+            sourceNode.start(nextStartTime);
+            nextStartTime += audioBuffer.duration;
+            audioSourceNodesRef.current.add(sourceNode);
+        };
 
-                mediaStreamSourceRef.current.connect(scriptProcessorRef.current);
-                scriptProcessorRef.current.connect(inputCtx.destination);
+        const handleInputTranscription = ({ text }: { text: string }) => {
+            currentInputTranscriptionRef.current += text;
+            setLiveUserMessage(currentInputTranscriptionRef.current);
+        };
+
+        const handleOutputTranscription = ({ text }: { text: string }) => {
+            currentOutputTranscriptionRef.current += text;
+            setLiveAiMessage(currentOutputTranscriptionRef.current);
+        };
+
+        const handleTurnComplete = () => {
+            const finalInput = currentInputTranscriptionRef.current.trim();
+            const finalOutput = currentOutputTranscriptionRef.current.trim();
+
+            if (finalInput && activeNotebookId) {
+                 const userInput: ChatMessage = { id: crypto.randomUUID(), sender: 'user', text: finalInput };
+                 const aiResponse: ChatMessage = { id: crypto.randomUUID(), sender: 'ai', text: finalOutput, question: finalInput };
+
+                 setWorkspace(prev => ({
+                     ...prev,
+                     notebooks: prev.notebooks.map(n =>
+                         n.id === activeNotebookId
+                             ? { ...n, chatHistory: [...n.chatHistory, userInput, aiResponse] }
+                             : n
+                     )
+                 }));
             }
+            
+            currentInputTranscriptionRef.current = '';
+            currentOutputTranscriptionRef.current = '';
+            setLiveUserMessage(null);
+            setLiveAiMessage(null);
+        };
+        
+        const handleError = (error: Event) => { 
+            console.error("Live session error:", error); 
+            if (error instanceof ErrorEvent && (error.message.includes('microphone') || error.message.includes('permission'))) {
+                alert("Could not access microphone. Please check permissions.");
+            }
+            stopVoiceMode(); 
+        };
+        const handleClose = () => {
+            if (isListening) { // Avoid calling stopVoiceMode if it was already stopped intentionally
+                stopVoiceMode();
+            }
+        };
 
-        } catch (error) {
-            console.error("Failed to start voice mode:", error);
-            alert("Could not access microphone. Please check permissions.");
-            stopVoiceMode();
-        }
-    }, [activeNotebook, stopVoiceMode, activeNotebookId]);
-    
-    const toggleVoiceMode = () => { isVoiceMode ? stopVoiceMode() : startVoiceMode(); };
-    useEffect(() => () => stopVoiceMode(), [stopVoiceMode]);
+        const unsubscribers = [
+            session.on('audioChunk', handleAudioChunk),
+            session.on('inputTranscription', handleInputTranscription),
+            session.on('outputTranscription', handleOutputTranscription),
+            session.on('turnComplete', handleTurnComplete),
+            session.on('error', handleError),
+            session.on('close', handleClose),
+        ];
+
+        session.start({
+            language,
+            documentContent: activeNotebook.source.content,
+        });
+
+        return () => {
+            unsubscribers.forEach(unsub => unsub());
+            session.stop();
+            liveSessionRef.current = null;
+        };
+
+    }, [isListening, activeNotebookId, activeNotebook?.source?.content, language, setWorkspace, stopVoiceMode]);
+
 
     const handleSaveNotebooks = async () => {
         if (notebooks.length === 0) {
@@ -1167,6 +1294,7 @@ const App: React.FC = () => {
                     }));
                 }
                 
+                chatSessionsRef.current.clear(); // Clear old chat sessions
                 setWorkspace(loadedWorkspace);
                 setIsDocumentViewActive(false);
                 alert(`${loadedWorkspace.notebooks.length} notebook(s) loaded successfully.`);
@@ -1186,7 +1314,10 @@ const App: React.FC = () => {
 
     const displaySource = activeNotebook?.source || null;
     const documentPanel = isDocumentViewActive && displaySource && activePdfDataUrl 
-        ? <DocumentViewerPanel source={{...displaySource, fileDataUrl: activePdfDataUrl}} />
+        ? <DocumentViewerPanel 
+            source={{...displaySource, fileDataUrl: activePdfDataUrl}}
+            isVisible={isDocumentViewActive}
+           />
         : (
             <ChatPanel
                 chatHistory={activeNotebook?.chatHistory || []}
@@ -1198,40 +1329,52 @@ const App: React.FC = () => {
                 toggleVoiceMode={toggleVoiceMode}
                 isListening={isListening}
                 notebookName={activeNotebook?.name || null}
+                language={language}
+                onLanguageChange={setLanguage}
+                liveUserMessage={liveUserMessage}
+                liveAiMessage={liveAiMessage}
             />
         );
 
     return (
         <div className="h-screen w-screen p-4 bg-gray-800 text-gray-200">
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 h-full">
-            <div className="lg:col-span-3 h-full">
-                <SourcesPanel 
-                    source={displaySource} 
-                    onFilePicked={handleFilePicked}
-                    isLoading={isLoading}
-                    hasActiveNotebook={!!activeNotebook}
-                    isDocumentViewActive={isDocumentViewActive}
-                    onToggleDocumentView={handleToggleDocumentView}
-                />
-            </div>
-            <div className="lg:col-span-6 h-full">
-                {documentPanel}
-            </div>
-            <div className="lg:col-span-3 h-full">
-                 <RightPanel
-                    savedNotes={activeNotebook?.savedNotes || []}
-                    notebooks={notebooks}
-                    activeNotebookId={activeNotebookId}
-                    onNewNotebook={handleNewNotebook}
-                    onSelectNotebook={handleSelectNotebook}
-                    onRenameNotebook={handleRenameNotebook}
-                    onDeleteNotebook={handleDeleteNotebook}
-                    onSaveNotebooks={handleSaveNotebooks}
-                    onLoadNotebooks={handleLoadNotebooks}
-                />
+            <ConfirmationDialog 
+                isOpen={dialogState.isOpen}
+                title={dialogState.title}
+                message={dialogState.message}
+                onConfirm={dialogState.onConfirm}
+                onCancel={closeDialog}
+            />
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 h-full">
+                <div className="lg:col-span-3 h-full">
+                    <SourcesPanel 
+                        source={displaySource} 
+                        onFilePicked={handleFilePicked}
+                        isLoading={isLoading}
+                        hasActiveNotebook={!!activeNotebook}
+                        isDocumentViewActive={isDocumentViewActive}
+                        onToggleDocumentView={handleToggleDocumentView}
+                    />
+                </div>
+                <div className="lg:col-span-6 h-full">
+                    {documentPanel}
+                </div>
+                <div className="lg:col-span-3 h-full">
+                     <RightPanel
+                        savedNotes={activeNotebook?.savedNotes || []}
+                        notebooks={notebooks}
+                        activeNotebookId={activeNotebookId}
+                        onNewNotebook={handleNewNotebook}
+                        onSelectNotebook={handleSelectNotebook}
+                        onRenameNotebook={handleRenameNotebook}
+                        onDeleteNotebook={handleDeleteNotebook}
+                        onSaveNotebooks={handleSaveNotebooks}
+                        onLoadNotebooks={handleLoadNotebooks}
+                        onClearAllNotebooks={handleClearAllNotebooks}
+                    />
+                </div>
             </div>
         </div>
-    </div>
     );
 };
 

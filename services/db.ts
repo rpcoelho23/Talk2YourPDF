@@ -67,3 +67,14 @@ export const deletePdfData = async (id: string): Promise<void> => {
         request.onerror = () => reject(request.error);
     });
 };
+
+export const clearAllPdfData = async (): Promise<void> => {
+    const db = await initDB();
+    const transaction = db.transaction(STORE_NAME, 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+    return new Promise((resolve, reject) => {
+        const request = store.clear();
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error);
+    });
+};

@@ -1,7 +1,12 @@
 
 
-import { GoogleGenAI, Modality, LiveServerMessage } from "@google/genai";
-import type { Blob } from "@google/genai";
+
+
+
+import { GoogleGenAI, Modality, LiveServerMessage, Chat } from "@google/genai";
+// FIX: Renamed imported `Blob` type to `GenAIBlob` to avoid conflict with the native browser `Blob` constructor.
+import type { Blob as GenAIBlob } from "@google/genai";
+import type { ChatMessage } from '../types';
 
 const API_KEY = process.env.API_KEY;
 
@@ -38,17 +43,36 @@ export const getTitleFromSummary = async (summary: string): Promise<string> => {
     }
 };
 
-export const getAnswer = async (question: string, documentContent: string): Promise<string> => {
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-pro",
-      contents: `Based on the following document, answer the user's question. If the answer isn't in the document, say so.\n\nDOCUMENT:\n${documentContent}\n\nQUESTION:\n${question}`,
-    });
-    return response.text;
-  } catch (error) {
-    console.error("Error getting answer:", error);
-    return "Sorry, I encountered an error trying to answer your question.";
-  }
+export const createChatSession = (documentContent: string, chatHistory: ChatMessage[] = []): Chat => {
+  const systemInstruction = `Based on the following document, answer the user's question. If the answer isn't in the document, say so. Be helpful and concise. The conversation may have started with a summary of the document.
+
+DOCUMENT:
+---
+${documentContent}
+---`;
+
+    const historyForGemini = chatHistory.map(msg => ({
+        role: msg.sender === 'user' ? 'user' as const : 'model' as const,
+        parts: [{ text: msg.text }]
+    }));
+
+    // For context, if the chat history starts with just the AI's summary,
+    // we prepend the user's implicit prompt that generated it.
+    if (historyForGemini.length === 1 && historyForGemini[0].role === 'model') {
+        historyForGemini.unshift({
+            role: 'user' as const,
+            parts: [{ text: `Provide a concise, one-paragraph summary of the provided document.` }]
+        });
+    }
+
+  const chat = ai.chats.create({
+    model: 'gemini-2.5-flash',
+    history: historyForGemini,
+    config: {
+      systemInstruction: systemInstruction,
+    },
+  });
+  return chat;
 };
 
 
@@ -67,12 +91,12 @@ const encode = (bytes: Uint8Array): string => {
     let binary = '';
     const len = bytes.byteLength;
     for (let i = 0; i < len; i++) {
-        binary += String.fromCharCode(bytes[i]); // FIX: Was String.fromCharCode(i)
+        binary += String.fromCharCode(bytes[i]);
     }
     return btoa(binary);
 };
 
-async function decodeAudioData(
+export async function decodeAudioData(
     data: Uint8Array,
     ctx: AudioContext,
     sampleRate: number,
@@ -126,36 +150,194 @@ export const readAloudStream = async (
   }
 };
 
+type Listener = (...args: any[]) => void;
+
+class EventEmitter {
+    private events: { [key: string]: Listener[] } = {};
+
+    on(event: string, listener: Listener): () => void {
+        if (!this.events[event]) {
+            this.events[event] = [];
+        }
+        this.events[event].push(listener);
+        return () => this.off(event, listener);
+    }
+
+    off(event: string, listener: Listener): void {
+        if (!this.events[event]) return;
+        this.events[event] = this.events[event].filter(l => l !== listener);
+    }
+
+    emit(event: string, ...args: any[]): void {
+        if (!this.events[event]) return;
+        this.events[event].forEach(listener => listener(...args));
+    }
+}
 
 // Live API for Voice Chat
-// FIX: The 'LiveSession' type is not exported from '@google/genai'. The return type is inferred instead.
-export const createLiveSession = (
-    onMessage: (message: LiveServerMessage) => void,
-    onError: (e: ErrorEvent) => void,
-    onClose: (e: CloseEvent) => void,
-) => {
-    const sessionPromise = ai.live.connect({
-        model: 'gemini-2.5-flash-native-audio-preview-09-2025',
-        callbacks: {
-            onopen: () => console.log('Live session opened.'),
-            onmessage: onMessage,
-            onerror: onError,
-            onclose: onClose,
-        },
-        config: {
-            responseModalities: [Modality.AUDIO],
-            inputAudioTranscription: {}, // Enable transcription for user input
-            outputAudioTranscription: {}, // Enable transcription for model output
-            speechConfig: {
-                voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
-            },
-            systemInstruction: 'You are a helpful and friendly research assistant. Your answers should be based on the document provided. Be concise.',
-        },
-    });
-    return sessionPromise;
-};
+export class LiveSessionManager {
+    private session: Awaited<ReturnType<GoogleGenAI['live']['connect']>> | null = null;
+    private inputAudioContext: AudioContext | null = null;
+    private mediaStream: MediaStream | null = null;
+    private inputWorkletNode: AudioWorkletNode | null = null;
+    private mediaStreamSource: MediaStreamAudioSourceNode | null = null;
+    private sessionPromise: Promise<Awaited<ReturnType<GoogleGenAI['live']['connect']>>> | null = null;
+    private emitter = new EventEmitter();
 
-export const createAudioBlob = (data: Float32Array): Blob => {
+    public on = this.emitter.on.bind(this.emitter);
+    public off = this.emitter.off.bind(this.emitter);
+
+    public async start(options: { language: string; documentContent: string; }) {
+        if (this.sessionPromise) {
+            console.warn("Session already starting.");
+            return;
+        }
+
+        const langMap: { [key: string]: string } = {
+            'en-US': 'English', 'pt-BR': 'Portuguese (Brazil)', 'es-ES': 'Spanish (Spain)',
+            'fr-FR': 'French (France)', 'de-DE': 'German (Germany)',
+        };
+        const langName = langMap[options.language] || 'English';
+
+        const systemInstruction = `You are a helpful and friendly research assistant. Your answers should be based on the document provided. Be concise. The user is speaking ${langName}. Please respond in ${langName}.
+
+DOCUMENT CONTEXT:
+---
+${options.documentContent}
+---`;
+
+        this.sessionPromise = ai.live.connect({
+            model: 'gemini-2.5-flash-native-audio-preview-09-2025',
+            callbacks: {
+                onopen: () => this.emitter.emit('open'),
+                onmessage: this.handleMessage.bind(this),
+                onerror: (e) => this.emitter.emit('error', e),
+                onclose: (e) => this.emitter.emit('close', e),
+            },
+            config: {
+                responseModalities: [Modality.AUDIO],
+                inputAudioTranscription: {},
+                outputAudioTranscription: {},
+                speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } } },
+                systemInstruction: systemInstruction,
+            },
+        });
+
+        try {
+            this.session = await this.sessionPromise;
+            await this.startMicrophone();
+        } catch (error) {
+            console.error("Failed to connect live session:", error);
+            const errorEvent = new ErrorEvent('connection-error', { error: error as Error });
+            this.emitter.emit('error', errorEvent);
+        }
+    }
+
+    private handleMessage(message: LiveServerMessage) {
+        const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+        if (base64Audio) {
+            this.emitter.emit('audioChunk', decode(base64Audio));
+        }
+
+        if (message.serverContent?.interrupted) {
+            this.emitter.emit('interrupted');
+        }
+
+        if (message.serverContent?.inputTranscription) {
+            this.emitter.emit('inputTranscription', {
+                text: message.serverContent.inputTranscription.text,
+                isFinal: (message.serverContent.inputTranscription as any).isFinal ?? false,
+            });
+        }
+        if (message.serverContent?.outputTranscription) {
+             this.emitter.emit('outputTranscription', {
+                text: message.serverContent.outputTranscription.text,
+                isFinal: (message.serverContent.outputTranscription as any).isFinal ?? false,
+            });
+        }
+
+        if (message.serverContent?.turnComplete) {
+            this.emitter.emit('turnComplete');
+        }
+    }
+
+    private async startMicrophone() {
+        try {
+            this.mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+            this.inputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+            if (this.inputAudioContext.state === 'suspended') {
+                await this.inputAudioContext.resume();
+            }
+
+            this.mediaStreamSource = this.inputAudioContext.createMediaStreamSource(this.mediaStream);
+
+            const inputAudioWorkletProcessorCode = `
+            class InputAudioProcessor extends AudioWorkletProcessor {
+              process(inputs, outputs, parameters) {
+                const inputChannel = inputs[0][0];
+                if (inputChannel) {
+                  this.port.postMessage(inputChannel);
+                }
+                return true;
+              }
+            }
+            registerProcessor('input-audio-processor', InputAudioProcessor);
+            `;
+            const workletBlob = new Blob([inputAudioWorkletProcessorCode], { type: 'application/javascript' });
+            const workletURL = URL.createObjectURL(workletBlob);
+            
+            try {
+                 await this.inputAudioContext.audioWorklet.addModule(workletURL);
+            } catch (e) {
+                if (!(e instanceof DOMException && e.name === 'InvalidStateError')) {
+                    throw e; 
+                }
+            }
+
+            this.inputWorkletNode = new AudioWorkletNode(this.inputAudioContext, 'input-audio-processor');
+
+            this.inputWorkletNode.port.onmessage = (event) => {
+                const inputData = event.data;
+                this.sessionPromise?.then((session) => {
+                    session.sendRealtimeInput({ media: createAudioBlob(inputData) });
+                });
+            };
+
+            this.mediaStreamSource.connect(this.inputWorkletNode);
+
+        } catch (error) {
+            console.error("Failed to start microphone:", error);
+            const errorEvent = new ErrorEvent('microphone-error', { error: error as Error });
+            this.emitter.emit('error', errorEvent);
+            this.stop();
+        }
+    }
+
+    public stop() {
+        this.session?.close();
+        this.session = null;
+        this.sessionPromise = null;
+
+        this.mediaStream?.getTracks().forEach(track => track.stop());
+        this.mediaStream = null;
+
+        this.inputWorkletNode?.port.close();
+        this.inputWorkletNode?.disconnect();
+        this.inputWorkletNode = null;
+
+        this.mediaStreamSource?.disconnect();
+        this.mediaStreamSource = null;
+
+        if (this.inputAudioContext && this.inputAudioContext.state !== 'closed') {
+            this.inputAudioContext.close().catch(e => console.error("Error closing input audio context:", e));
+            this.inputAudioContext = null;
+        }
+    }
+}
+
+
+const createAudioBlob = (data: Float32Array): GenAIBlob => {
     const l = data.length;
     const int16 = new Int16Array(l);
     for (let i = 0; i < l; i++) {
@@ -166,5 +348,3 @@ export const createAudioBlob = (data: Float32Array): Blob => {
         mimeType: 'audio/pcm;rate=16000',
     };
 };
-
-export { decodeAudioData };
