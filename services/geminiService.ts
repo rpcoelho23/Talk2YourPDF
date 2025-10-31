@@ -219,7 +219,7 @@ ${options.documentContent}
                 inputAudioTranscription: {},
                 outputAudioTranscription: {},
                 speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } } },
-                systemInstruction: systemInstruction,
+                systemInstruction: { parts: [{ text: systemInstruction }] },
             },
         });
 

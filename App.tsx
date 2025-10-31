@@ -344,9 +344,22 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ chatHistory, onSendMessage, onPin
     const audioWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
     const abortControllerRef = useRef<AbortController | null>(null);
     
+    // We derive a boolean to check if any live transcription is active.
+    // The effect will only re-run when this boolean *changes* state (e.g., from false to true),
+    // or when the permanent chat history is updated. This prevents the scroll from being
+    // triggered on every single character update during live transcription, which was causing UI lag.
+    const isLiveTranscriptionActive = !!liveUserMessage || !!liveAiMessage;
+
     useEffect(() => {
-        chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }, [chatHistory, liveUserMessage, liveAiMessage]);
+        if (chatEndRef.current) {
+            // Use an instant scroll ('auto') during live transcription to keep the view at the
+            // bottom without the performance cost of rapid smooth scrolling.
+            // Use a smooth scroll when a turn is added to the permanent history for a nicer feel.
+            const behavior = isLiveTranscriptionActive ? 'auto' : 'smooth';
+            chatEndRef.current.scrollIntoView({ behavior });
+        }
+    }, [chatHistory, isLiveTranscriptionActive]);
+
 
     const stopPlayback = useCallback(() => {
         abortControllerRef.current?.abort();
