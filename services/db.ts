@@ -33,13 +33,39 @@ const initDB = (): Promise<IDBDatabase> => {
     });
 };
 
-export const savePdfData = async (id: string, dataUrl: string): Promise<void> => {
+export const savePdfData = async (id: string, dataUrl: string, extractedText?: string): Promise<void> => {
     const db = await initDB();
     const transaction = db.transaction(STORE_NAME, 'readwrite');
     const store = transaction.objectStore(STORE_NAME);
     return new Promise((resolve, reject) => {
-        const request = store.put({ id, dataUrl });
-        request.onsuccess = () => resolve();
+        const getRequest = store.get(id);
+        getRequest.onsuccess = () => {
+            const existing = getRequest.result || {};
+            const putRequest = store.put({
+                id,
+                dataUrl: dataUrl || existing.dataUrl,
+                extractedText: extractedText !== undefined ? extractedText : existing.extractedText
+            });
+            putRequest.onsuccess = () => resolve();
+            putRequest.onerror = () => reject(putRequest.error);
+        };
+        getRequest.onerror = () => {
+            const putRequest = store.put({ id, dataUrl, extractedText });
+            putRequest.onsuccess = () => resolve();
+            putRequest.onerror = () => reject(putRequest.error);
+        };
+    });
+};
+
+export const getExtractedText = async (id: string): Promise<string | null> => {
+    const db = await initDB();
+    const transaction = db.transaction(STORE_NAME, 'readonly');
+    const store = transaction.objectStore(STORE_NAME);
+    return new Promise((resolve, reject) => {
+        const request = store.get(id);
+        request.onsuccess = () => {
+            resolve(request.result ? request.result.extractedText : null);
+        };
         request.onerror = () => reject(request.error);
     });
 };

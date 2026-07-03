@@ -5,7 +5,7 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import type { Source, ChatMessage, SavedNote, Notebook } from './types';
 import { getSummary, getTitleFromSummary, createChatSession, readAloudStream, LiveSessionManager } from './services/geminiService';
-import { savePdfData, getPdfData, deletePdfData, clearAllPdfData } from './services/db';
+import { savePdfData, getPdfData, deletePdfData, clearAllPdfData, getExtractedText } from './services/db';
 import type { Chat } from '@google/genai';
 import {
     PdfIcon, ChartBarIcon, CheckIcon, PinIcon, SpeakerWaveIcon, MicrophoneIcon,
@@ -317,8 +317,9 @@ interface ChatPanelProps {
     liveUserMessage: string | null;
     liveAiMessage: string | null;
     streamingAiResponse: string | null;
+    setErrorModal: (modal: { isOpen: boolean; title: string; message: string; subMessage?: string } | null) => void;
 }
-const ChatPanel: React.FC<ChatPanelProps> = ({ chatHistory, onSendMessage, onPinMessage, isLoading, source, isVoiceMode, toggleVoiceMode, isListening, notebookName, language, onLanguageChange, liveUserMessage, liveAiMessage, streamingAiResponse }) => {
+const ChatPanel: React.FC<ChatPanelProps> = ({ chatHistory, onSendMessage, onPinMessage, isLoading, source, isVoiceMode, toggleVoiceMode, isListening, notebookName, language, onLanguageChange, liveUserMessage, liveAiMessage, streamingAiResponse, setErrorModal }) => {
     const [input, setInput] = useState('');
     const chatEndRef = useRef<HTMLDivElement>(null);
     const [playingMessageId, setPlayingMessageId] = useState<string | null>(null);
@@ -327,6 +328,7 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ chatHistory, onSendMessage, onPin
     const readAloudAudioContextRef = useRef<AudioContext | null>(null);
     const readAloudWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
     const readAloudAbortControllerRef = useRef<AbortController | null>(null);
+    const readAloudWorkletLoadedRef = useRef<boolean>(false);
     
     const isLiveTranscriptionActive = !!liveUserMessage || !!liveAiMessage || streamingAiResponse !== null;
 
@@ -364,15 +366,19 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ chatHistory, onSendMessage, onPin
         try {
             if (!readAloudAudioContextRef.current || readAloudAudioContextRef.current.state === 'closed') {
                 readAloudAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+                readAloudWorkletLoadedRef.current = false;
             }
             const audioContext = readAloudAudioContextRef.current;
             if (audioContext.state === 'suspended') {
                 await audioContext.resume();
             }
 
-            const workletBlob = new Blob([audioWorkletProcessorCode], { type: 'application/javascript' });
-            const workletURL = URL.createObjectURL(workletBlob);
-            await audioContext.audioWorklet.addModule(workletURL);
+            if (!readAloudWorkletLoadedRef.current) {
+                const workletBlob = new Blob([audioWorkletProcessorCode], { type: 'application/javascript' });
+                const workletURL = URL.createObjectURL(workletBlob);
+                await audioContext.audioWorklet.addModule(workletURL);
+                readAloudWorkletLoadedRef.current = true;
+            }
             
             const workletNode = new AudioWorkletNode(audioContext, 'streaming-audio-processor');
             workletNode.port.onmessage = (event) => {
@@ -395,26 +401,35 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ chatHistory, onSendMessage, onPin
                 readAloudWorkletNodeRef.current.port.postMessage(float32);
             };
 
-            // Split text into sentences for a more responsive, streaming feel.
-            const sentences = text.replace(/([.?!])\s*(?=[A-Z])/g, "$1|").split("|");
-
-            for (const sentence of sentences) {
-                if (controller.signal.aborted) {
-                    break;
-                }
-                if (sentence.trim()) { // Don't send empty strings to the API
-                    await readAloudStream(
-                        sentence,
-                        onAudioChunk,
-                        controller.signal
-                    );
-                }
+            // Call text-to-speech once on the entire text for continuous, natural reading without stutters
+            if (text.trim() && !controller.signal.aborted) {
+                await readAloudStream(
+                    text,
+                    onAudioChunk,
+                    controller.signal
+                );
             }
 
-        } catch (error) {
-            if ((error as Error).name !== 'AbortError') {
+        } catch (error: any) {
+            if (error?.name !== 'AbortError') {
                 console.error("Failed to stream audio", error);
-                alert("Sorry, could not generate audio for this message.");
+                const errorMsg = error?.message || String(error);
+                const isKeyError = errorMsg.toLowerCase().includes('key') || 
+                                   errorMsg.toLowerCase().includes('credential') || 
+                                   errorMsg.toLowerCase().includes('api_key') || 
+                                   errorMsg.toLowerCase().includes('unauthorized') ||
+                                   errorMsg.toLowerCase().includes('forbidden') ||
+                                   errorMsg.toLowerCase().includes('api-key');
+                if (isKeyError) {
+                    setErrorModal({
+                        isOpen: true,
+                        title: "Invalid Gemini API Key",
+                        message: "Could not read the message aloud because the Gemini API key is invalid or missing.",
+                        subMessage: "Please verify that GEMINI_API_KEY is set correctly in your environment variables."
+                    });
+                } else {
+                    alert("Sorry, could not generate audio for this message.");
+                }
                 stopPlayback();
             }
         } finally {
@@ -423,7 +438,7 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ chatHistory, onSendMessage, onPin
                 readAloudWorkletNodeRef.current.port.postMessage(null);
             }
         }
-    }, [playingMessageId, stopPlayback]);
+    }, [playingMessageId, stopPlayback, setErrorModal]);
     
     // Cleanup audio resources on component unmount
     useEffect(() => {
@@ -809,6 +824,9 @@ const App: React.FC = () => {
     // State for the confirmation dialog
     const [dialogState, setDialogState] = useState({ isOpen: false, title: '', message: '', onConfirm: () => {} });
 
+    // State for the custom error modal (e.g. invalid API key)
+    const [errorModal, setErrorModal] = useState<{ isOpen: boolean; title: string; message: string; subMessage?: string } | null>(null);
+
     const chatSessionsRef = useRef<Map<string, Chat>>(new Map());
     const liveSessionRef = useRef<LiveSessionManager | null>(null);
     const liveUserTranscriptionRef = useRef('');
@@ -838,13 +856,13 @@ const App: React.FC = () => {
 
     useEffect(() => {
         try {
-            // Save everything *except* the PDF data URL to avoid quota errors.
+            // Save everything *except* the PDF data URL and extracted content text to avoid quota errors.
             const dataToSave: Workspace = {
                 ...workspace,
                 notebooks: workspace.notebooks.map(nb => {
                     if (!nb.source) return nb;
-                    const { fileDataUrl, ...sourceWithoutDataUrl } = nb.source;
-                    return { ...nb, source: sourceWithoutDataUrl as Source };
+                    const { fileDataUrl, content, ...sourceWithoutDataOrContent } = nb.source;
+                    return { ...nb, source: sourceWithoutDataOrContent as Source };
                 })
             };
             localStorage.setItem('notebook_workspace', JSON.stringify(dataToSave));
@@ -852,6 +870,37 @@ const App: React.FC = () => {
             console.error("Failed to save to localStorage", error);
         }
     }, [workspace]);
+
+    // Automatically load the full extracted text from IndexedDB when a notebook is active and content is missing in state
+    useEffect(() => {
+        if (!activeNotebookId || !activeNotebook || !activeNotebook.source) return;
+        if (activeNotebook.source.content) return; // already in memory
+
+        let isCurrent = true;
+        getExtractedText(activeNotebookId).then(text => {
+            if (isCurrent && text) {
+                setWorkspace(prev => {
+                    const currentActive = prev.notebooks.find(n => n.id === prev.activeNotebookId);
+                    if (!currentActive || !currentActive.source || currentActive.source.content) return prev;
+                    
+                    return {
+                        ...prev,
+                        notebooks: prev.notebooks.map(n => 
+                            n.id === prev.activeNotebookId && n.source 
+                                ? { ...n, source: { ...n.source, content: text } } 
+                                : n
+                        )
+                    };
+                });
+            }
+        }).catch(err => {
+            console.error("Failed to load active notebook content from IndexedDB", err);
+        });
+
+        return () => {
+            isCurrent = false;
+        };
+    }, [activeNotebookId, activeNotebook?.source?.content]);
 
     const addErrorMessageToChat = useCallback((message: string) => {
         if (!activeNotebookId) {
@@ -1002,7 +1051,7 @@ const App: React.FC = () => {
             
             if (notebookToUpdateId) {
                 const dataUrl = await fileToBase64(file);
-                await savePdfData(notebookToUpdateId, dataUrl);
+                await savePdfData(notebookToUpdateId, dataUrl, extractedText);
             }
 
             const summary = await getSummary(source.content);
@@ -1030,9 +1079,27 @@ const App: React.FC = () => {
                 })
             }));
 
-        } catch (error) {
+        } catch (error: any) {
             console.error("Error processing PDF:", error);
-            alert("There was an error processing the PDF. It may be corrupted.");
+            const errorMsg = error?.message || String(error);
+            const isKeyError = errorMsg.toLowerCase().includes('key') || 
+                               errorMsg.toLowerCase().includes('credential') || 
+                               errorMsg.toLowerCase().includes('api_key') || 
+                               errorMsg.toLowerCase().includes('unauthorized') ||
+                               errorMsg.toLowerCase().includes('forbidden') ||
+                               errorMsg.toLowerCase().includes('api-key');
+            
+            if (isKeyError) {
+                setErrorModal({
+                    isOpen: true,
+                    title: "Invalid Gemini API Key",
+                    message: "The application could not generate a summary because the Gemini API key is invalid or missing.",
+                    subMessage: "Please verify that GEMINI_API_KEY is set correctly in your environment variables and reload the page."
+                });
+            } else {
+                alert(`There was an error processing the PDF: ${errorMsg}`);
+            }
+            
              if (isNewNotebook) {
                 setWorkspace(prev => ({ ...prev, notebooks: prev.notebooks.filter(n => n.id !== notebookToUpdateId) }));
             }
@@ -1106,8 +1173,25 @@ const App: React.FC = () => {
                     n.id === activeNotebookId ? { ...n, chatHistory: [...n.chatHistory, aiMessage] } : n
                 )
             }));
-        } catch (error) {
+        } catch (error: any) {
             console.error("Error sending message:", error);
+            const errorMsg = error?.message || String(error);
+            const isKeyError = errorMsg.toLowerCase().includes('key') || 
+                               errorMsg.toLowerCase().includes('credential') || 
+                               errorMsg.toLowerCase().includes('api_key') || 
+                               errorMsg.toLowerCase().includes('unauthorized') ||
+                               errorMsg.toLowerCase().includes('forbidden') ||
+                               errorMsg.toLowerCase().includes('api-key');
+            
+            if (isKeyError) {
+                setErrorModal({
+                    isOpen: true,
+                    title: "Invalid Gemini API Key",
+                    message: "The message could not be sent because the Gemini API key is invalid or missing.",
+                    subMessage: "Please verify that GEMINI_API_KEY is set correctly in your environment variables."
+                });
+            }
+            
             const errorMessage = "Sorry, I encountered an error trying to answer your question.";
             const aiMessage: ChatMessage = { id: crypto.randomUUID(), sender: 'ai', text: errorMessage, question: message };
             setWorkspace(prev => ({
@@ -1293,7 +1377,22 @@ const App: React.FC = () => {
             if (error instanceof ErrorEvent) {
                 errorMessage = `Error: ${error.message}`;
             }
-            addErrorMessageToChat(errorMessage);
+            const isKeyError = errorMessage.toLowerCase().includes('key') || 
+                               errorMessage.toLowerCase().includes('credential') || 
+                               errorMessage.toLowerCase().includes('api_key') || 
+                               errorMessage.toLowerCase().includes('unauthorized') ||
+                               errorMessage.toLowerCase().includes('forbidden') ||
+                               errorMessage.toLowerCase().includes('api-key');
+            if (isKeyError) {
+                setErrorModal({
+                    isOpen: true,
+                    title: "Invalid Gemini API Key",
+                    message: "Could not start the voice chat session because the Gemini API key is invalid or missing.",
+                    subMessage: "Please verify that GEMINI_API_KEY is set correctly in your environment variables."
+                });
+            } else {
+                addErrorMessageToChat(errorMessage);
+            }
             stopVoiceMode();
         };
 
@@ -1310,6 +1409,7 @@ const App: React.FC = () => {
         session.start({
             language,
             documentSummary: summary,
+            documentContent: activeNotebook.source.content,
         });
 
         return () => {
@@ -1331,12 +1431,18 @@ const App: React.FC = () => {
             // Create a deep clone to avoid mutating state
             const workspaceToSave: Workspace = JSON.parse(JSON.stringify(workspace));
 
-            // Enhance notebooks with embedded PDF data
+            // Enhance notebooks with embedded PDF data and content
             await Promise.all(workspaceToSave.notebooks.map(async (nb) => {
                 if (nb.source) {
                     const dataUrl = await getPdfData(nb.id);
                     if (dataUrl) {
                         nb.source.fileDataUrl = dataUrl;
+                    }
+                    if (!nb.source.content) {
+                        const content = await getExtractedText(nb.id);
+                        if (content) {
+                            nb.source.content = content;
+                        }
                     }
                 }
             }));
@@ -1373,11 +1479,11 @@ const App: React.FC = () => {
                     throw new Error("JSON file is not in the correct format.");
                 }
 
-                const notebooksWithPdfs = loadedWorkspace.notebooks.filter(nb => nb.source?.fileDataUrl);
+                const notebooksWithPdfs = loadedWorkspace.notebooks.filter(nb => nb.source?.fileDataUrl || nb.source?.content);
                 if (notebooksWithPdfs.length > 0) {
                      await Promise.all(notebooksWithPdfs.map(async (nb) => {
-                        if (nb.source?.fileDataUrl) {
-                            await savePdfData(nb.id, nb.source.fileDataUrl);
+                        if (nb.source) {
+                            await savePdfData(nb.id, nb.source.fileDataUrl || '', nb.source.content);
                         }
                     }));
                 }
@@ -1422,6 +1528,7 @@ const App: React.FC = () => {
                 liveUserMessage={liveUserMessage}
                 liveAiMessage={liveAiMessage}
                 streamingAiResponse={streamingAiResponse}
+                setErrorModal={setErrorModal}
             />
         );
 
@@ -1434,6 +1541,33 @@ const App: React.FC = () => {
                 onConfirm={dialogState.onConfirm}
                 onCancel={closeDialog}
             />
+
+            {errorModal && errorModal.isOpen && ( 
+                <div className="fixed inset-0 bg-black/75 backdrop-blur-sm flex items-center justify-center z-50 animate-fade-in" aria-modal="true" role="dialog">
+                    <div className="bg-gray-900 border border-red-500/30 rounded-2xl p-6 shadow-2xl max-w-md w-full mx-4 transform transition-all scale-100">
+                        <div className="flex items-center gap-3 mb-4">
+                            <div className="w-10 h-10 rounded-full bg-red-950/50 border border-red-500/50 flex items-center justify-center text-red-500 flex-shrink-0">
+                                <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                                </svg>
+                            </div>
+                            <h3 className="text-xl font-bold text-red-400">{errorModal.title}</h3>
+                        </div>
+                        <p className="text-gray-200 text-sm mb-3 leading-relaxed">{errorModal.message}</p>
+                        {errorModal.subMessage && (
+                            <p className="text-gray-400 text-xs bg-gray-950/60 p-3 rounded-lg font-mono border border-gray-800 leading-normal">{errorModal.subMessage}</p>
+                        )}
+                        <div className="flex justify-end mt-6">
+                            <button 
+                                onClick={() => setErrorModal(null)} 
+                                className="px-5 py-2.5 rounded-xl bg-red-600 hover:bg-red-500 text-white font-medium shadow-lg hover:shadow-red-600/20 transition-all text-sm cursor-pointer animate-none" 
+                            >
+                                Got it
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 h-full">
                 <div className="lg:col-span-3 h-full">
                     <SourcesPanel 

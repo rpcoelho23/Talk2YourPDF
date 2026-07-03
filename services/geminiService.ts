@@ -5,32 +5,39 @@ import { GoogleGenAI, Modality, LiveServerMessage, Chat } from "@google/genai";
 import type { Blob as GenAIBlob } from "@google/genai";
 import type { ChatMessage } from '../types';
 
-const API_KEY = process.env.API_KEY;
+let aiInstance: GoogleGenAI | null = null;
 
-if (!API_KEY) {
-  throw new Error("API_KEY environment variable not set");
-}
-
-const ai = new GoogleGenAI({ apiKey: API_KEY });
+export const getAI = (): GoogleGenAI => {
+    if (!aiInstance) {
+        const apiKey = process.env.API_KEY || process.env.GEMINI_API_KEY;
+        if (!apiKey) {
+            throw new Error("GEMINI_API_KEY environment variable is not set. Please set it in your environment variables.");
+        }
+        aiInstance = new GoogleGenAI({ apiKey });
+    }
+    return aiInstance;
+};
 
 // Text Generation
 export const getSummary = async (documentContent: string): Promise<string> => {
   try {
+    const ai = getAI();
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-pro",
+      model: "gemini-3.5-flash",
       contents: `Provide a concise, one-paragraph summary of the following academic paper:\n\n${documentContent}`,
     });
     return response.text;
   } catch (error) {
     console.error("Error getting summary:", error);
-    return "Sorry, I couldn't generate a summary for this document.";
+    throw error; // Propagate error so calling code can detect key/API errors
   }
 };
 
 export const getTitleFromSummary = async (summary: string): Promise<string> => {
     try {
+        const ai = getAI();
         const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash",
+            model: "gemini-3.5-flash",
             contents: `Based on the following summary, create a short, descriptive title of 8 words or less.\n\nSUMMARY:\n${summary}`,
         });
         return response.text.replace(/"/g, ''); // Remove quotes from title
@@ -41,7 +48,12 @@ export const getTitleFromSummary = async (summary: string): Promise<string> => {
 };
 
 export const createChatSession = (documentContent: string, chatHistory: ChatMessage[] = []): Chat => {
-  const systemInstruction = `Based on the following document, answer the user's question. If the answer isn't in the document, say so. Be helpful and concise. The conversation may have started with a summary of the document.
+  const systemInstruction = `Based on the following document, answer the user's question directly, accurately, and concisely. If the answer isn't in the document, say so. 
+
+CRITICAL DIRECTIVES:
+- Do not guess or speculate on what the user's next step is.
+- Do not suggest what the user might want to do next or ask unsolicited follow-up questions (such as "Are you looking for information from that paper?" or proposing what to read/do next).
+- Simply answer the exact question asked and STOP. Avoid any forward-looking or proactive conversational fillers.
 
 DOCUMENT:
 ---
@@ -62,8 +74,9 @@ ${documentContent}
         });
     }
 
+  const ai = getAI();
   const chat = ai.chats.create({
-    model: 'gemini-2.5-flash',
+    model: 'gemini-3.5-flash',
     history: historyForGemini,
     config: {
       systemInstruction: systemInstruction,
@@ -120,8 +133,9 @@ export const readAloudStream = async (
   signal: AbortSignal
 ): Promise<void> => {
   try {
+    const ai = getAI();
     const responseStream = await ai.models.generateContentStream({
-      model: "gemini-2.5-flash-preview-tts",
+      model: "gemini-3.1-flash-tts-preview",
       contents: [{ parts: [{ text: `Read this text naturally: ${text}` }] }],
       config: {
         responseModalities: [Modality.AUDIO],
@@ -143,6 +157,7 @@ export const readAloudStream = async (
   } catch (error) {
     if ((error as Error).name !== 'AbortError') {
        console.error("Error with text-to-speech stream:", error);
+       throw error;
     }
   }
 };
@@ -184,12 +199,12 @@ export class LiveSessionManager {
     public on = this.emitter.on.bind(this.emitter);
     public off = this.emitter.off.bind(this.emitter);
 
-    public async start(options: { language: string; documentSummary: string; }) {
+    public async start(options: { language: string; documentSummary: string; documentContent?: string; }) {
         if (this.sessionPromise) {
             console.warn("LiveSessionManager: Start called while a session is already starting.");
             return;
         }
-        console.log("LiveSessionManager: Starting new session with options:", options);
+        console.log("LiveSessionManager: Starting new session with options:", { ...options, documentContent: options.documentContent ? `${options.documentContent.substring(0, 100)}...` : 'undefined' });
 
         const langMap: { [key: string]: string } = {
             'en-US': 'English', 'pt-BR': 'Portuguese (Brazil)', 'es-ES': 'Spanish (Spain)',
@@ -197,11 +212,21 @@ export class LiveSessionManager {
         };
         const langName = langMap[options.language] || 'English';
 
-        const systemInstructionText = `You are a helpful and friendly research assistant. Your answers should be based on the provided document summary. Be concise and conversational. The user is speaking ${langName}. Please respond in ${langName}.
+        const systemInstructionText = `You are a helpful and friendly research assistant. Your answers should be based on the provided document summary and full document content. Be concise and conversational. The user is speaking ${langName}. Please respond in ${langName}.
+
+CRITICAL DIRECTIVES:
+- Do not guess or speculate on what the user's next step is.
+- Do not suggest what the user might want to do next or ask unsolicited follow-up questions (such as "Are you looking for information from that paper?" or proposing what to read/do next).
+- Simply answer the exact question asked directly and STOP. Avoid any forward-looking or proactive conversational fillers.
 
 DOCUMENT SUMMARY:
 ---
 ${options.documentSummary}
+---
+
+FULL DOCUMENT CONTENT:
+---
+${options.documentContent || 'No full document content was provided.'}
 ---`;
         
         const config = {
@@ -214,9 +239,9 @@ ${options.documentSummary}
 
         console.log("LiveSessionManager: Connecting with config:", JSON.stringify(config, null, 2));
 
-
+        const ai = getAI();
         this.sessionPromise = ai.live.connect({
-            model: 'gemini-2.5-flash-native-audio-preview-09-2025',
+            model: 'gemini-3.1-flash-live-preview',
             callbacks: {
                 onopen: () => {
                     console.log("LiveSessionManager: Session opened.");
@@ -295,7 +320,7 @@ ${options.documentSummary}
                 const inputData = audioProcessingEvent.inputBuffer.getChannelData(0);
                 // Using sessionPromise ensures we don't send data before the connection is established.
                 this.sessionPromise?.then((session) => {
-                    session.sendRealtimeInput({ media: createAudioBlob(inputData) });
+                    session.sendRealtimeInput({ audio: createAudioBlob(inputData) });
                 });
             };
 
