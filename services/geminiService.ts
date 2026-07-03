@@ -1,8 +1,5 @@
 
 
-
-
-
 import { GoogleGenAI, Modality, LiveServerMessage, Chat } from "@google/genai";
 // FIX: Renamed imported `Blob` type to `GenAIBlob` to avoid conflict with the native browser `Blob` constructor.
 import type { Blob as GenAIBlob } from "@google/genai";
@@ -179,7 +176,7 @@ export class LiveSessionManager {
     private session: Awaited<ReturnType<GoogleGenAI['live']['connect']>> | null = null;
     private inputAudioContext: AudioContext | null = null;
     private mediaStream: MediaStream | null = null;
-    private inputWorkletNode: AudioWorkletNode | null = null;
+    private scriptProcessor: ScriptProcessorNode | null = null;
     private mediaStreamSource: MediaStreamAudioSourceNode | null = null;
     private sessionPromise: Promise<Awaited<ReturnType<GoogleGenAI['live']['connect']>>> | null = null;
     private emitter = new EventEmitter();
@@ -187,11 +184,12 @@ export class LiveSessionManager {
     public on = this.emitter.on.bind(this.emitter);
     public off = this.emitter.off.bind(this.emitter);
 
-    public async start(options: { language: string; documentContent: string; }) {
+    public async start(options: { language: string; documentSummary: string; }) {
         if (this.sessionPromise) {
-            console.warn("Session already starting.");
+            console.warn("LiveSessionManager: Start called while a session is already starting.");
             return;
         }
+        console.log("LiveSessionManager: Starting new session with options:", options);
 
         const langMap: { [key: string]: string } = {
             'en-US': 'English', 'pt-BR': 'Portuguese (Brazil)', 'es-ES': 'Spanish (Spain)',
@@ -199,138 +197,147 @@ export class LiveSessionManager {
         };
         const langName = langMap[options.language] || 'English';
 
-        const systemInstruction = `You are a helpful and friendly research assistant. Your answers should be based on the document provided. Be concise. The user is speaking ${langName}. Please respond in ${langName}.
+        const systemInstructionText = `You are a helpful and friendly research assistant. Your answers should be based on the provided document summary. Be concise and conversational. The user is speaking ${langName}. Please respond in ${langName}.
 
-DOCUMENT CONTEXT:
+DOCUMENT SUMMARY:
 ---
-${options.documentContent}
+${options.documentSummary}
 ---`;
+        
+        const config = {
+            responseModalities: [Modality.AUDIO],
+            inputAudioTranscription: {},
+            outputAudioTranscription: {},
+            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } },
+            systemInstruction: systemInstructionText,
+        };
+
+        console.log("LiveSessionManager: Connecting with config:", JSON.stringify(config, null, 2));
+
 
         this.sessionPromise = ai.live.connect({
             model: 'gemini-2.5-flash-native-audio-preview-09-2025',
             callbacks: {
-                onopen: () => this.emitter.emit('open'),
+                onopen: () => {
+                    console.log("LiveSessionManager: Session opened.");
+                    this.emitter.emit('open');
+                },
                 onmessage: this.handleMessage.bind(this),
-                onerror: (e) => this.emitter.emit('error', e),
-                onclose: (e) => this.emitter.emit('close', e),
+                onerror: (e) => {
+                    console.error("LiveSessionManager: Received error from Gemini:", e);
+                    this.emitter.emit('error', e);
+                },
+                onclose: (e) => {
+                    console.log("LiveSessionManager: Session closed by Gemini.", e);
+                    this.emitter.emit('close', e);
+                },
             },
-            config: {
-                responseModalities: [Modality.AUDIO],
-                inputAudioTranscription: {},
-                outputAudioTranscription: {},
-                speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } } },
-                systemInstruction: { parts: [{ text: systemInstruction }] },
-            },
+            config: config,
         });
 
         try {
             this.session = await this.sessionPromise;
+            console.log("LiveSessionManager: Session connected successfully.");
             await this.startMicrophone();
         } catch (error) {
-            console.error("Failed to connect live session:", error);
+            console.error("LiveSessionManager: Failed to connect live session:", error);
             const errorEvent = new ErrorEvent('connection-error', { error: error as Error });
             this.emitter.emit('error', errorEvent);
         }
     }
 
     private handleMessage(message: LiveServerMessage) {
+        // console.debug("LiveSessionManager: Received message:", message); // Can be noisy
         const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
         if (base64Audio) {
             this.emitter.emit('audioChunk', decode(base64Audio));
         }
 
         if (message.serverContent?.interrupted) {
+            console.log("LiveSessionManager: Model turn interrupted.");
             this.emitter.emit('interrupted');
         }
 
         if (message.serverContent?.inputTranscription) {
             this.emitter.emit('inputTranscription', {
                 text: message.serverContent.inputTranscription.text,
-                isFinal: (message.serverContent.inputTranscription as any).isFinal ?? false,
             });
         }
         if (message.serverContent?.outputTranscription) {
              this.emitter.emit('outputTranscription', {
                 text: message.serverContent.outputTranscription.text,
-                isFinal: (message.serverContent.outputTranscription as any).isFinal ?? false,
             });
         }
 
         if (message.serverContent?.turnComplete) {
+            console.log("LiveSessionManager: Turn complete.");
             this.emitter.emit('turnComplete');
         }
     }
 
     private async startMicrophone() {
+        console.log("LiveSessionManager: Attempting to start microphone...");
         try {
             this.mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            console.log("LiveSessionManager: Microphone access granted.");
 
             this.inputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
             if (this.inputAudioContext.state === 'suspended') {
+                console.log("LiveSessionManager: Resuming suspended audio context.");
                 await this.inputAudioContext.resume();
             }
 
             this.mediaStreamSource = this.inputAudioContext.createMediaStreamSource(this.mediaStream);
-
-            const inputAudioWorkletProcessorCode = `
-            class InputAudioProcessor extends AudioWorkletProcessor {
-              process(inputs, outputs, parameters) {
-                const inputChannel = inputs[0][0];
-                if (inputChannel) {
-                  this.port.postMessage(inputChannel);
-                }
-                return true;
-              }
-            }
-            registerProcessor('input-audio-processor', InputAudioProcessor);
-            `;
-            const workletBlob = new Blob([inputAudioWorkletProcessorCode], { type: 'application/javascript' });
-            const workletURL = URL.createObjectURL(workletBlob);
             
-            try {
-                 await this.inputAudioContext.audioWorklet.addModule(workletURL);
-            } catch (e) {
-                if (!(e instanceof DOMException && e.name === 'InvalidStateError')) {
-                    throw e; 
-                }
-            }
+            this.scriptProcessor = this.inputAudioContext.createScriptProcessor(4096, 1, 1);
 
-            this.inputWorkletNode = new AudioWorkletNode(this.inputAudioContext, 'input-audio-processor');
-
-            this.inputWorkletNode.port.onmessage = (event) => {
-                const inputData = event.data;
+            this.scriptProcessor.onaudioprocess = (audioProcessingEvent) => {
+                const inputData = audioProcessingEvent.inputBuffer.getChannelData(0);
+                // Using sessionPromise ensures we don't send data before the connection is established.
                 this.sessionPromise?.then((session) => {
                     session.sendRealtimeInput({ media: createAudioBlob(inputData) });
                 });
             };
 
-            this.mediaStreamSource.connect(this.inputWorkletNode);
+            this.mediaStreamSource.connect(this.scriptProcessor);
+            this.scriptProcessor.connect(this.inputAudioContext.destination);
+            console.log("LiveSessionManager: Microphone and audio processor are now connected.");
 
         } catch (error) {
-            console.error("Failed to start microphone:", error);
+            console.error("LiveSessionManager: Failed to start microphone:", error);
             const errorEvent = new ErrorEvent('microphone-error', { error: error as Error });
             this.emitter.emit('error', errorEvent);
-            this.stop();
         }
     }
 
     public stop() {
+        console.log("LiveSessionManager: Stopping session and cleaning up resources.");
         this.session?.close();
         this.session = null;
         this.sessionPromise = null;
 
-        this.mediaStream?.getTracks().forEach(track => track.stop());
-        this.mediaStream = null;
+        if (this.mediaStream) {
+            this.mediaStream.getTracks().forEach(track => track.stop());
+            this.mediaStream = null;
+             console.log("LiveSessionManager: Media stream stopped.");
+        }
 
-        this.inputWorkletNode?.port.close();
-        this.inputWorkletNode?.disconnect();
-        this.inputWorkletNode = null;
-
-        this.mediaStreamSource?.disconnect();
-        this.mediaStreamSource = null;
+        if (this.scriptProcessor) {
+            this.scriptProcessor.disconnect();
+            this.scriptProcessor = null;
+            console.log("LiveSessionManager: Script processor disconnected.");
+        }
+        
+        if (this.mediaStreamSource) {
+            this.mediaStreamSource.disconnect();
+            this.mediaStreamSource = null;
+            console.log("LiveSessionManager: Media stream source disconnected.");
+        }
 
         if (this.inputAudioContext && this.inputAudioContext.state !== 'closed') {
-            this.inputAudioContext.close().catch(e => console.error("Error closing input audio context:", e));
+            this.inputAudioContext.close().then(() => {
+                console.log("LiveSessionManager: Input audio context closed.");
+            }).catch(e => console.error("LiveSessionManager: Error closing input audio context:", e));
             this.inputAudioContext = null;
         }
     }

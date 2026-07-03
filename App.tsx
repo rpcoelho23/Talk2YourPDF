@@ -1,9 +1,12 @@
 
+
+
+
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import type { Source, ChatMessage, SavedNote, Notebook } from './types';
-import { getSummary, getTitleFromSummary, createChatSession, readAloudStream, LiveSessionManager, decodeAudioData, decode } from './services/geminiService';
+import { getSummary, getTitleFromSummary, createChatSession, readAloudStream, LiveSessionManager } from './services/geminiService';
 import { savePdfData, getPdfData, deletePdfData, clearAllPdfData } from './services/db';
-import type { LiveServerMessage, Chat } from '@google/genai';
+import type { Chat } from '@google/genai';
 import {
     PdfIcon, ChartBarIcon, CheckIcon, PinIcon, SpeakerWaveIcon, MicrophoneIcon,
     StopCircleIcon, ArrowUpCircleIcon, PencilIcon, TrashIcon, ArrowDownTrayIcon, ArrowUpTrayIcon
@@ -17,19 +20,6 @@ const fileToBase64 = (file: File): Promise<string> =>
     reader.onload = () => resolve(reader.result as string);
     reader.onerror = (error) => reject(error);
   });
-
-// Helper to convert Base64 data URL back to a Blob
-const base64ToBlob = (dataUrl: string): Blob => {
-    const [header, data] = dataUrl.split(',');
-    const mime = header.match(/:(.*?);/)?.[1];
-    const byteString = atob(data);
-    let n = byteString.length;
-    const u8arr = new Uint8Array(n);
-    while (n--) {
-        u8arr[n] = byteString.charCodeAt(n);
-    }
-    return new Blob([u8arr], { type: mime });
-}
 
 // Panel Header Component
 interface PanelHeaderProps {
@@ -311,13 +301,6 @@ class StreamingAudioProcessor extends AudioWorkletProcessor {
 registerProcessor('streaming-audio-processor', StreamingAudioProcessor);
 `;
 
-// Splits text into sentences for chunked TTS streaming
-const splitIntoSentences = (text: string): string[] => {
-    // This regex matches sentences ending in ., ?, or !, and handles the end of the string.
-    const sentences = text.match(/[^.!?]+[.!?]\s*|[^.!?]+$/g);
-    return sentences ? sentences.map(s => s.trim()).filter(s => s.length > 0) : [];
-};
-
 // Chat Panel Component
 interface ChatPanelProps {
     chatHistory: ChatMessage[];
@@ -333,63 +316,40 @@ interface ChatPanelProps {
     onLanguageChange: (lang: string) => void;
     liveUserMessage: string | null;
     liveAiMessage: string | null;
+    streamingAiResponse: string | null;
 }
-const ChatPanel: React.FC<ChatPanelProps> = ({ chatHistory, onSendMessage, onPinMessage, isLoading, source, isVoiceMode, toggleVoiceMode, isListening, notebookName, language, onLanguageChange, liveUserMessage, liveAiMessage }) => {
+const ChatPanel: React.FC<ChatPanelProps> = ({ chatHistory, onSendMessage, onPinMessage, isLoading, source, isVoiceMode, toggleVoiceMode, isListening, notebookName, language, onLanguageChange, liveUserMessage, liveAiMessage, streamingAiResponse }) => {
     const [input, setInput] = useState('');
     const chatEndRef = useRef<HTMLDivElement>(null);
     const [playingMessageId, setPlayingMessageId] = useState<string | null>(null);
     
-    // Refs for AudioWorklet-based streaming playback
-    const audioContextRef = useRef<AudioContext | null>(null);
-    const audioWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
-    const abortControllerRef = useRef<AbortController | null>(null);
+    // Refs for AudioWorklet-based streaming playback for "Read Aloud"
+    const readAloudAudioContextRef = useRef<AudioContext | null>(null);
+    const readAloudWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
+    const readAloudAbortControllerRef = useRef<AbortController | null>(null);
     
-    // We derive a boolean to check if any live transcription is active.
-    // The effect will only re-run when this boolean *changes* state (e.g., from false to true),
-    // or when the permanent chat history is updated. This prevents the scroll from being
-    // triggered on every single character update during live transcription, which was causing UI lag.
-    const isLiveTranscriptionActive = !!liveUserMessage || !!liveAiMessage;
+    const isLiveTranscriptionActive = !!liveUserMessage || !!liveAiMessage || streamingAiResponse !== null;
 
     useEffect(() => {
         if (chatEndRef.current) {
-            // Use an instant scroll ('auto') during live transcription to keep the view at the
-            // bottom without the performance cost of rapid smooth scrolling.
-            // Use a smooth scroll when a turn is added to the permanent history for a nicer feel.
             const behavior = isLiveTranscriptionActive ? 'auto' : 'smooth';
             chatEndRef.current.scrollIntoView({ behavior });
         }
-    }, [chatHistory, isLiveTranscriptionActive]);
+    }, [chatHistory, isLiveTranscriptionActive, liveUserMessage, liveAiMessage, streamingAiResponse]);
 
 
     const stopPlayback = useCallback(() => {
-        abortControllerRef.current?.abort();
-        abortControllerRef.current = null;
-        if (audioWorkletNodeRef.current) {
-            audioWorkletNodeRef.current.port.onmessage = null;
-            audioWorkletNodeRef.current.disconnect();
-            audioWorkletNodeRef.current = null;
+        readAloudAbortControllerRef.current?.abort();
+        readAloudAbortControllerRef.current = null;
+        if (readAloudWorkletNodeRef.current) {
+            readAloudWorkletNodeRef.current.port.onmessage = null;
+            readAloudWorkletNodeRef.current.disconnect();
+            readAloudWorkletNodeRef.current = null;
         }
         setPlayingMessageId(null);
     }, []);
 
-    // Cleanup audio resources on component unmount
-    useEffect(() => {
-        return () => {
-            stopPlayback();
-            if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-                audioContextRef.current.close();
-            }
-        };
-    }, [stopPlayback]);
-
-    const handleSend = () => {
-        if (input.trim() && !isLoading) {
-            onSendMessage(input);
-            setInput('');
-        }
-    };
-
-    const handleToggleReadAloud = async ({ id, text }: { id: string, text: string }) => {
+    const handleToggleReadAloud = useCallback(async ({ id, text }: { id: string, text: string }) => {
         if (playingMessageId === id) {
             stopPlayback();
             return;
@@ -398,14 +358,14 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ chatHistory, onSendMessage, onPin
         stopPlayback(); // Stop any currently playing audio
 
         const controller = new AbortController();
-        abortControllerRef.current = controller;
+        readAloudAbortControllerRef.current = controller;
         setPlayingMessageId(id);
 
         try {
-            if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
-                audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+            if (!readAloudAudioContextRef.current || readAloudAudioContextRef.current.state === 'closed') {
+                readAloudAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
             }
-            const audioContext = audioContextRef.current;
+            const audioContext = readAloudAudioContextRef.current;
             if (audioContext.state === 'suspended') {
                 await audioContext.resume();
             }
@@ -421,28 +381,34 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ chatHistory, onSendMessage, onPin
                 }
             };
             workletNode.connect(audioContext.destination);
-            audioWorkletNodeRef.current = workletNode;
+            readAloudWorkletNodeRef.current = workletNode;
             
-            const sentences = splitIntoSentences(text);
+            const onAudioChunk = (audioChunk: Uint8Array) => {
+                if (controller.signal.aborted || !readAloudWorkletNodeRef.current) return;
+                
+                const pcm16 = new Int16Array(audioChunk.buffer, audioChunk.byteOffset, audioChunk.byteLength / 2);
+                const float32 = new Float32Array(pcm16.length);
+                for (let i = 0; i < pcm16.length; i++) {
+                    float32[i] = pcm16[i] / 32768.0;
+                }
+                
+                readAloudWorkletNodeRef.current.port.postMessage(float32);
+            };
+
+            // Split text into sentences for a more responsive, streaming feel.
+            const sentences = text.replace(/([.?!])\s*(?=[A-Z])/g, "$1|").split("|");
 
             for (const sentence of sentences) {
-                if (controller.signal.aborted) break;
-                
-                await readAloudStream(
-                    sentence,
-                    (audioChunk) => { // onAudioChunk callback
-                        if (controller.signal.aborted || !audioWorkletNodeRef.current) return;
-                        
-                        const pcm16 = new Int16Array(audioChunk.buffer, audioChunk.byteOffset, audioChunk.byteLength / 2);
-                        const float32 = new Float32Array(pcm16.length);
-                        for (let i = 0; i < pcm16.length; i++) {
-                            float32[i] = pcm16[i] / 32768.0;
-                        }
-                        
-                        audioWorkletNodeRef.current.port.postMessage(float32);
-                    },
-                    controller.signal
-                );
+                if (controller.signal.aborted) {
+                    break;
+                }
+                if (sentence.trim()) { // Don't send empty strings to the API
+                    await readAloudStream(
+                        sentence,
+                        onAudioChunk,
+                        controller.signal
+                    );
+                }
             }
 
         } catch (error) {
@@ -452,10 +418,27 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ chatHistory, onSendMessage, onPin
                 stopPlayback();
             }
         } finally {
-            if (!controller.signal.aborted && audioWorkletNodeRef.current) {
+            if (!controller.signal.aborted && readAloudWorkletNodeRef.current) {
                 // Signal to the worklet that the stream has ended.
-                audioWorkletNodeRef.current.port.postMessage(null);
+                readAloudWorkletNodeRef.current.port.postMessage(null);
             }
+        }
+    }, [playingMessageId, stopPlayback]);
+    
+    // Cleanup audio resources on component unmount
+    useEffect(() => {
+        return () => {
+            stopPlayback();
+            if (readAloudAudioContextRef.current && readAloudAudioContextRef.current.state !== 'closed') {
+                readAloudAudioContextRef.current.close();
+            }
+        };
+    }, [stopPlayback]);
+
+    const handleSend = () => {
+        if (input.trim() && !isLoading) {
+            onSendMessage(input);
+            setInput('');
         }
     };
     
@@ -516,51 +499,80 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ chatHistory, onSendMessage, onPin
             {!source && (
                  <div className="text-center text-gray-400">Create a new notebook or select an existing one to begin.</div>
             )}
-            {chatHistory.map((msg, index) => (
-            <div key={msg.id} className={`flex ${msg.sender === 'user' ? 'justify-end' : 'justify-start'}`}>
-                <div className={`max-w-xl rounded-lg px-4 py-3 ${msg.sender === 'user' ? 'bg-blue-600 text-white' : 'bg-gray-700'}`}>
-                {msg.sender === 'ai' && index === 0 && notebookName && (
-                     <>
-                        <div className="flex items-center gap-2 mb-2">
-                            <ChartBarIcon className="w-8 h-8"/>
-                            <h3 className="text-xl font-bold">{notebookName}</h3>
-                        </div>
-                        <p className="text-sm text-gray-400 mb-2">1 source</p>
-                    </>
-                )}
-                <p className="text-base">{msg.text}</p>
-                 {msg.sender === 'ai' && (
-                    <div className="flex items-center gap-2 mt-4">
-                        {index === 0 ? (
-                            <button onClick={() => handleToggleReadAloud({ id: msg.id, text: msg.text })} className="flex items-center gap-2 text-sm bg-gray-600/50 hover:bg-gray-600 px-3 py-1 rounded-full transition-colors">
-                                <SpeakerWaveIcon className="w-4 h-4" /> {playingMessageId === msg.id ? 'Stop' : 'Read'}
-                            </button>
-                        ) : (
-                            <>
-                                {!msg.isPinned ? (
-                                    <button onClick={() => onPinMessage(msg.id, msg.question!, msg.text)} className="flex items-center gap-2 text-sm bg-gray-600/50 hover:bg-gray-600 px-3 py-1 rounded-full transition-colors">
-                                        <PinIcon className="w-4 h-4" /> Save to note
-                                    </button>
-                                ) : (
-                                    <span className="flex items-center gap-1 text-xs text-green-400">
-                                        <CheckIcon className="w-3 h-3"/> Pinned!
-                                    </span>
-                                )}
-                                <button onClick={() => handleToggleReadAloud({ id: msg.id, text: msg.text })} className="flex items-center gap-2 text-sm bg-gray-600/50 hover:bg-gray-600 px-3 py-1 rounded-full transition-colors">
-                                    <SpeakerWaveIcon className="w-4 h-4" /> {playingMessageId === msg.id ? 'Stop' : 'Read'}
-                                </button>
+            {chatHistory.map((msg, index) => {
+                const isDebugLog = msg.text.startsWith('[DEBUG LOG]');
+                return (
+                    <div key={msg.id} className={`flex ${msg.sender === 'user' ? 'justify-end' : 'justify-start'}`}>
+                        <div className={`max-w-xl rounded-lg px-4 py-3 ${
+                            msg.sender === 'user' 
+                            ? 'bg-blue-600 text-white' 
+                            : isDebugLog
+                                ? 'bg-red-900/60 border border-red-700'
+                                : 'bg-gray-700'
+                        }`}>
+                        
+                        {msg.sender === 'ai' && !isDebugLog && index === 0 && notebookName && (
+                             <>
+                                <div className="flex items-center gap-2 mb-2">
+                                    <ChartBarIcon className="w-8 h-8"/>
+                                    <h3 className="text-xl font-bold">{notebookName}</h3>
+                                </div>
+                                <p className="text-sm text-gray-400 mb-2">1 source</p>
                             </>
                         )}
+
+                        <p className={`text-base ${isDebugLog ? 'text-red-200 font-mono text-xs whitespace-pre-wrap' : ''}`}>{msg.text}</p>
+                        
+                         {msg.sender === 'ai' && !isDebugLog && (
+                            <div className="flex items-center gap-2 mt-4">
+                                {index === 0 ? (
+                                    <button onClick={() => handleToggleReadAloud({ id: msg.id, text: msg.text })} className="flex items-center gap-2 text-sm bg-gray-600/50 hover:bg-gray-600 px-3 py-1 rounded-full transition-colors">
+                                        <SpeakerWaveIcon className="w-4 h-4" /> {playingMessageId === msg.id ? 'Stop' : 'Read'}
+                                    </button>
+                                ) : (
+                                    <>
+                                        <button
+                                            onClick={() => !msg.isPinned && onPinMessage(msg.id, msg.question!, msg.text)}
+                                            disabled={!!msg.isPinned}
+                                            className={`flex items-center gap-2 text-sm px-3 py-1 rounded-full transition-colors ${
+                                                msg.isPinned
+                                                ? 'bg-green-800/60 text-green-300 cursor-default'
+                                                : 'bg-gray-600/50 hover:bg-gray-600'
+                                            }`}
+                                        >
+                                            {msg.isPinned ? (
+                                                <>
+                                                    <CheckIcon className="w-4 h-4" /> Saved
+                                                </>
+                                            ) : (
+                                                <>
+                                                    <PinIcon className="w-4 h-4" /> Save to note
+                                                </>
+                                            )}
+                                        </button>
+                                        <button onClick={() => handleToggleReadAloud({ id: msg.id, text: msg.text })} className="flex items-center gap-2 text-sm bg-gray-600/50 hover:bg-gray-600 px-3 py-1 rounded-full transition-colors">
+                                            <SpeakerWaveIcon className="w-4 h-4" /> {playingMessageId === msg.id ? 'Stop' : 'Read'}
+                                        </button>
+                                    </>
+                                )}
+                            </div>
+                        )}
+                        </div>
                     </div>
-                )}
-                </div>
-            </div>
-            ))}
-            {isLoading && !isVoiceMode && <div className="text-center text-gray-400">Gemini is thinking...</div>}
+                );
+            })}
+            {isLoading && !isVoiceMode && streamingAiResponse === null && <div className="text-center text-gray-400">Gemini is thinking...</div>}
             {liveUserMessage && (
                 <div className="flex justify-end" aria-live="polite">
                     <div className="max-w-xl rounded-lg px-4 py-3 bg-blue-600 text-white opacity-90">
                         <p className="text-base">{liveUserMessage}<span className="inline-block w-2 h-4 bg-white ml-1 animate-pulse"></span></p>
+                    </div>
+                </div>
+            )}
+             {streamingAiResponse !== null && (
+                <div className="flex justify-start" aria-live="polite">
+                    <div className="max-w-xl rounded-lg px-4 py-3 bg-gray-700">
+                        <p className="text-base">{streamingAiResponse}<span className="inline-block w-2 h-4 bg-gray-300 ml-1 animate-pulse"></span></p>
                     </div>
                 </div>
             )}
@@ -792,12 +804,19 @@ const App: React.FC = () => {
     const [language, setLanguage] = useState('en-US');
     const [liveUserMessage, setLiveUserMessage] = useState<string | null>(null);
     const [liveAiMessage, setLiveAiMessage] = useState<string | null>(null);
+    const [streamingAiResponse, setStreamingAiResponse] = useState<string | null>(null);
     
-
     // State for the confirmation dialog
     const [dialogState, setDialogState] = useState({ isOpen: false, title: '', message: '', onConfirm: () => {} });
 
     const chatSessionsRef = useRef<Map<string, Chat>>(new Map());
+    const liveSessionRef = useRef<LiveSessionManager | null>(null);
+    const liveUserTranscriptionRef = useRef('');
+    const liveAiTranscriptionRef = useRef('');
+
+    // Refs for live audio playback
+    const audioContextRef = useRef<AudioContext | null>(null);
+    const audioWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
 
     const { notebooks, activeNotebookId } = workspace;
     const activeNotebook = notebooks.find(n => n.id === activeNotebookId) || null;
@@ -834,6 +853,24 @@ const App: React.FC = () => {
         }
     }, [workspace]);
 
+    const addErrorMessageToChat = useCallback((message: string) => {
+        if (!activeNotebookId) {
+            console.error("DEBUG LOG (no active notebook):", message);
+            alert(`A system error occurred:\n\n${message}`);
+            return;
+        }
+        const errorChatMessage: ChatMessage = {
+            id: crypto.randomUUID(),
+            sender: 'ai',
+            text: `[DEBUG LOG]\n\n${message}`,
+        };
+        setWorkspace(prev => ({
+            ...prev,
+            notebooks: prev.notebooks.map(n => 
+                n.id === activeNotebookId ? { ...n, chatHistory: [...n.chatHistory, errorChatMessage] } : n
+            )
+        }));
+    }, [activeNotebookId]);
 
     const handleNewNotebook = () => {
         const timestamp = new Date();
@@ -1043,20 +1080,26 @@ const App: React.FC = () => {
         }));
 
         setIsLoading(true);
+        setStreamingAiResponse('');
         
         try {
             let chat = chatSessionsRef.current.get(activeNotebook.id);
 
-            // Lazy-load chat session if it doesn't exist (e.g., after loading from file)
+            // Lazy-load chat session if it doesn't exist
             if (!chat) {
                 chat = createChatSession(activeNotebook.source.content, activeNotebook.chatHistory);
                 chatSessionsRef.current.set(activeNotebook.id, chat);
             }
             
-            const response = await chat.sendMessage({ message });
-            const answer = response.text;
+            const responseStream = await chat.sendMessageStream({ message });
+            
+            let fullResponse = '';
+            for await (const chunk of responseStream) {
+                fullResponse += chunk.text;
+                setStreamingAiResponse(fullResponse);
+            }
 
-            const aiMessage: ChatMessage = { id: crypto.randomUUID(), sender: 'ai', text: answer, question: message };
+            const aiMessage: ChatMessage = { id: crypto.randomUUID(), sender: 'ai', text: fullResponse, question: message };
             setWorkspace(prev => ({
                 ...prev,
                 notebooks: prev.notebooks.map(n =>
@@ -1065,7 +1108,7 @@ const App: React.FC = () => {
             }));
         } catch (error) {
             console.error("Error sending message:", error);
-            const errorMessage = "Sorry, I encountered an error trying to answeryour question.";
+            const errorMessage = "Sorry, I encountered an error trying to answer your question.";
             const aiMessage: ChatMessage = { id: crypto.randomUUID(), sender: 'ai', text: errorMessage, question: message };
             setWorkspace(prev => ({
                 ...prev,
@@ -1075,6 +1118,7 @@ const App: React.FC = () => {
             }));
         } finally {
             setIsLoading(false);
+            setStreamingAiResponse(null);
         }
     };
 
@@ -1103,16 +1147,12 @@ const App: React.FC = () => {
         }));
     };
     
-    const liveSessionRef = useRef<LiveSessionManager | null>(null);
-    const outputAudioContextRef = useRef<AudioContext | null>(null);
-    const audioSourceNodesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
-    
     const stopVoiceMode = useCallback(() => {
         setIsListening(false);
         setIsVoiceMode(false);
     }, []);
 
-    const startVoiceMode = useCallback(() => {
+    const startVoiceMode = useCallback(async () => {
         if (!activeNotebook?.source?.content) {
             alert("Please add a document to a notebook before starting voice mode.");
             return;
@@ -1123,20 +1163,63 @@ const App: React.FC = () => {
 
     const toggleVoiceMode = () => { isListening ? stopVoiceMode() : startVoiceMode(); };
 
+    const setupAudioPlayer = useCallback(async () => {
+        try {
+            if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+                await audioContextRef.current.close();
+            }
+            const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+            audioContextRef.current = audioContext;
+
+            if (audioContext.state === 'suspended') {
+                await audioContext.resume();
+            }
+
+            const workletBlob = new Blob([audioWorkletProcessorCode], { type: 'application/javascript' });
+            const workletURL = URL.createObjectURL(workletBlob);
+            try {
+                await audioContext.audioWorklet.addModule(workletURL);
+            } catch (e) {
+                console.error("Error adding audio worklet module", e);
+                return;
+            } finally {
+                URL.revokeObjectURL(workletURL);
+            }
+            
+            const workletNode = new AudioWorkletNode(audioContext, 'streaming-audio-processor');
+            workletNode.connect(audioContext.destination);
+            audioWorkletNodeRef.current = workletNode;
+        } catch (e) {
+            console.error("Failed to setup audio player:", e);
+            addErrorMessageToChat(`Could not initialize audio player: ${(e as Error).message}`);
+        }
+    }, [addErrorMessageToChat]);
+
+    const playAudioChunk = useCallback((chunk: Uint8Array) => {
+        if (!audioWorkletNodeRef.current) return;
+        
+        const pcm16 = new Int16Array(chunk.buffer, chunk.byteOffset, chunk.byteLength / 2);
+        const float32 = new Float32Array(pcm16.length);
+        for (let i = 0; i < pcm16.length; i++) {
+            float32[i] = pcm16[i] / 32768.0;
+        }
+        
+        audioWorkletNodeRef.current.port.postMessage(float32);
+    }, []);
+
     // This effect manages the entire lifecycle of the voice session
     useEffect(() => {
         if (!isListening) {
             liveSessionRef.current?.stop();
             liveSessionRef.current = null;
-
-            audioSourceNodesRef.current.forEach(source => source.stop());
-            audioSourceNodesRef.current.clear();
-
-            if (outputAudioContextRef.current && outputAudioContextRef.current.state !== 'closed') {
-                outputAudioContextRef.current.close().catch(console.error);
-                outputAudioContextRef.current = null;
+            if (audioWorkletNodeRef.current) {
+                audioWorkletNodeRef.current.disconnect();
+                audioWorkletNodeRef.current = null;
             }
-            
+            if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+                audioContextRef.current.close();
+                audioContextRef.current = null;
+            }
             setLiveUserMessage(null);
             setLiveAiMessage(null);
             return;
@@ -1147,94 +1230,86 @@ const App: React.FC = () => {
             return;
         }
         
+        const summary = activeNotebook.chatHistory?.[0]?.text;
+        if (!summary) {
+            addErrorMessageToChat("Could not start voice session: The document summary is not available. Please ensure the document has been processed correctly.");
+            stopVoiceMode();
+            return;
+        }
+        
         const session = new LiveSessionManager();
         liveSessionRef.current = session;
-        
-        const currentInputTranscriptionRef = { current: '' };
-        const currentOutputTranscriptionRef = { current: '' };
-        
-        let nextStartTime = 0;
-        if (!outputAudioContextRef.current || outputAudioContextRef.current.state === 'closed') {
-            outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-        }
-        const outputCtx = outputAudioContextRef.current;
+        liveUserTranscriptionRef.current = '';
+        liveAiTranscriptionRef.current = '';
 
-        const handleAudioChunk = async (audioData: Uint8Array) => {
-            if (!outputCtx) return;
-            if (outputCtx.state === 'suspended') await outputCtx.resume();
-            
-            nextStartTime = Math.max(nextStartTime, outputCtx.currentTime);
-            const audioBuffer = await decodeAudioData(audioData, outputCtx, 24000, 1);
-            
-            const sourceNode = outputCtx.createBufferSource();
-            sourceNode.buffer = audioBuffer;
-            sourceNode.connect(outputCtx.destination);
-            
-            sourceNode.onended = () => audioSourceNodesRef.current.delete(sourceNode);
-            sourceNode.start(nextStartTime);
-            nextStartTime += audioBuffer.duration;
-            audioSourceNodesRef.current.add(sourceNode);
-        };
+        setupAudioPlayer();
 
         const handleInputTranscription = ({ text }: { text: string }) => {
-            currentInputTranscriptionRef.current += text;
-            setLiveUserMessage(currentInputTranscriptionRef.current);
+            liveUserTranscriptionRef.current = text;
+            setLiveUserMessage(text);
         };
-
+        
         const handleOutputTranscription = ({ text }: { text: string }) => {
-            currentOutputTranscriptionRef.current += text;
-            setLiveAiMessage(currentOutputTranscriptionRef.current);
+            liveAiTranscriptionRef.current += text;
+            setLiveAiMessage(liveAiTranscriptionRef.current);
         };
-
+        
         const handleTurnComplete = () => {
-            const finalInput = currentInputTranscriptionRef.current.trim();
-            const finalOutput = currentOutputTranscriptionRef.current.trim();
-
-            if (finalInput && activeNotebookId) {
-                 const userInput: ChatMessage = { id: crypto.randomUUID(), sender: 'user', text: finalInput };
-                 const aiResponse: ChatMessage = { id: crypto.randomUUID(), sender: 'ai', text: finalOutput, question: finalInput };
-
-                 setWorkspace(prev => ({
-                     ...prev,
-                     notebooks: prev.notebooks.map(n =>
-                         n.id === activeNotebookId
-                             ? { ...n, chatHistory: [...n.chatHistory, userInput, aiResponse] }
-                             : n
-                     )
-                 }));
-            }
+            const userQuestion = liveUserTranscriptionRef.current.trim();
+            const aiAnswer = liveAiTranscriptionRef.current.trim();
             
-            currentInputTranscriptionRef.current = '';
-            currentOutputTranscriptionRef.current = '';
+            if (userQuestion && aiAnswer && activeNotebookId) {
+                const userMessage: ChatMessage = { id: crypto.randomUUID(), sender: 'user', text: userQuestion };
+                const aiMessage: ChatMessage = { id: crypto.randomUUID(), sender: 'ai', text: aiAnswer, question: userQuestion };
+
+                setWorkspace(prev => ({
+                    ...prev,
+                    notebooks: prev.notebooks.map(n =>
+                        n.id === activeNotebookId
+                            ? { ...n, chatHistory: [...n.chatHistory, userMessage, aiMessage] }
+                            : n
+                    )
+                }));
+            }
+            liveUserTranscriptionRef.current = '';
+            liveAiTranscriptionRef.current = '';
             setLiveUserMessage(null);
             setLiveAiMessage(null);
         };
+
+        const handleInterrupted = () => {
+             if (audioWorkletNodeRef.current && audioContextRef.current) {
+                audioWorkletNodeRef.current.disconnect();
+                const newNode = new AudioWorkletNode(audioContextRef.current, 'streaming-audio-processor');
+                newNode.connect(audioContextRef.current.destination);
+                audioWorkletNodeRef.current = newNode;
+             }
+             liveAiTranscriptionRef.current = '';
+             setLiveAiMessage(null);
+        }
         
-        const handleError = (error: Event) => { 
-            console.error("Live session error:", error); 
-            if (error instanceof ErrorEvent && (error.message.includes('microphone') || error.message.includes('permission'))) {
-                alert("Could not access microphone. Please check permissions.");
+        const handleError = (error: Event) => {
+            let errorMessage = 'An unknown error occurred in the voice session.';
+            if (error instanceof ErrorEvent) {
+                errorMessage = `Error: ${error.message}`;
             }
-            stopVoiceMode(); 
-        };
-        const handleClose = () => {
-            if (isListening) { // Avoid calling stopVoiceMode if it was already stopped intentionally
-                stopVoiceMode();
-            }
+            addErrorMessageToChat(errorMessage);
+            stopVoiceMode();
         };
 
         const unsubscribers = [
-            session.on('audioChunk', handleAudioChunk),
+            session.on('audioChunk', playAudioChunk),
             session.on('inputTranscription', handleInputTranscription),
             session.on('outputTranscription', handleOutputTranscription),
+            session.on('interrupted', handleInterrupted),
             session.on('turnComplete', handleTurnComplete),
             session.on('error', handleError),
-            session.on('close', handleClose),
+            session.on('close', stopVoiceMode),
         ];
 
         session.start({
             language,
-            documentContent: activeNotebook.source.content,
+            documentSummary: summary,
         });
 
         return () => {
@@ -1243,7 +1318,7 @@ const App: React.FC = () => {
             liveSessionRef.current = null;
         };
 
-    }, [isListening, activeNotebookId, activeNotebook?.source?.content, language, setWorkspace, stopVoiceMode]);
+    }, [isListening, activeNotebookId, activeNotebook?.source?.content, activeNotebook?.chatHistory, language, stopVoiceMode, addErrorMessageToChat, setupAudioPlayer, playAudioChunk]);
 
 
     const handleSaveNotebooks = async () => {
@@ -1346,6 +1421,7 @@ const App: React.FC = () => {
                 onLanguageChange={setLanguage}
                 liveUserMessage={liveUserMessage}
                 liveAiMessage={liveAiMessage}
+                streamingAiResponse={streamingAiResponse}
             />
         );
 
